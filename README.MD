@@ -9,11 +9,14 @@ Sync OIDC users from **Proxmox VE** into real **Linux** accounts: create local u
 > **This script will refuse to start unless the file is owned by `root:root` and has permissions `0700`.** 
 > That’s intentional, don't remove this code from the script: when run automatically, a misconfigured copy of this script could let **anyone** drop/modify it and thereby create **full sudo accounts** on the box.
 >
-> **Do this before enabling the timer/service:**
+> **Before enabling the service or timer, enforce correct ownership and permissions:**
 >
 > ```bash
 > sudo chown root:root /usr/local/sbin/sudomatic5000.py
+> sudo chown root:root /usr/local/sbin/sudomatic_check.sh
+>
 > sudo chmod 700 /usr/local/sbin/sudomatic5000.py
+> sudo chmod 700 /usr/local/sbin/sudomatic_check.sh
 > ```
 >
 > **Also ensure the service runs as root and paths aren’t world-writable:**
@@ -25,49 +28,24 @@ Sync OIDC users from **Proxmox VE** into real **Linux** accounts: create local u
 >
 > If ownership/permissions don’t match, the script **actively exits** to prevent privilege-escalation via file tampering.
 
-
-
 ---
-
-
 
 ## Quick start
 
 ```bash
-# Put the script somewhere sensible
-sudo install -m 0700 sudomatic5000.py /usr/local/sbin/sudomatic5000.py
+# First-time installation (deploys script, checker, service, and timer)
+sudo ./installer.py install
 
-# Log directory (owned by root, restricted)
-sudo install -d -m 0750 -o root -g root /var/log/sudomatic5000
+# View service logs
+journalctl -u sudomatic.service
 
-# Optional: systemd (run every 30 min)
-cat | sudo tee /etc/systemd/system/sudomatic.service >/dev/null <<'UNIT'
-[Unit]
-Description=Sudomatic 5000 — Proxmox OIDC to Linux user sync
-After=network-online.target pve-cluster.service
-Wants=network-online.target
+# --- Updating later ---
 
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/python3 /usr/local/sbin/sudomatic5000.py
-User=root
-UNIT
+# Replace sudomatic5000.py in this directory, then run:
+sudo ./installer.py update
 
-cat | sudo tee /etc/systemd/system/sudomatic.timer >/dev/null <<'TIMER'
-[Unit]
-Description=Run Sudomatic 5000 every 30 minutes
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=30min
-Unit=sudomatic.service
-AccuracySec=1min
-Persistent=true
-[Install]
-WantedBy=timers.target
-TIMER
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now sudomatic.timer
+# Optionally restart the service automatically after updating:
+sudo ./installer.py update --restart
 ```
 
 ---
