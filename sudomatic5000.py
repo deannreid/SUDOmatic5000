@@ -28,13 +28,13 @@ from colorama import Fore, Style
 #===========#
 # Variables #
 #===========#
-VERSION = "1.3.4"
+VERSION = "1.3.5"
 MIN_PYTHON_VERSION = (3, 10)
 ADMIN_REQUIRED = True   # yes, this needs root
 
 # --- Tweakers ---
 REALM = "SSOREALMNAME-HERE"         # Must match the Proxmox realm name exactly or shit breaks.
-DEFAULT_SHELL = "/bin/bash"
+DEFAULT_SHELL = "/bin/bash"         # /bin/bash ; /bin/zsh
 
 EXTRA_GROUPS = ["sudo"]             # Supplementary groups (set [] if you only want sudoers files created)
 GRANT_SUDO = True                   # Per-user sudoers in /etc/sudoers.d - False only creates the user
@@ -157,29 +157,36 @@ BLURBS = [
 # Purpose : Ensure script is only executed by root and has safe perms
 # Notes   : Exits with warning if insecure
 # ================================================================
-def fncScriptSecurityCheck():
-    script_path = os.path.realpath(__file__)
-    st = os.stat(script_path)
+def fncScriptSecurityCheck(exit_on_fail: bool = False) -> bool:
+    def _fail(msg: str) -> bool:
+        logging.critical("SECURITY: %s", msg)
+        if exit_on_fail:
+            sys.exit(1)
+        return False
+
+    try:
+        script_path = os.path.realpath(__file__)
+        st = os.stat(script_path)
+    except Exception as e:
+        return _fail(f"Cannot stat script: {e}")
 
     # 1. Must be executed as root
     if os.geteuid() != 0:
-        fncPrintMessage("This script must be run as root.", "error")
-        sys.exit(1)
+        return _fail("This script must be run as root.")
 
     # 2. Must be owned by root
     if st.st_uid != 0:
-        fncPrintMessage("Script must be owned by root.", "error")
-        sys.exit(1)
+        return _fail(f"Script must be owned by root (uid=0). Found uid={st.st_uid}.")
 
     # 3. Permissions must not allow group/others ANY access
-    bad_perms = stat.S_IRWXG | stat.S_IRWXO
-    if st.st_mode & bad_perms:
-        fncPrintMessage(
-            f"Insecure permissions on {script_path}. "
-            "Only root should have access (chmod 700).",
-            "error"
+    mode = st.st_mode & 0o777
+    if (mode & 0o077) != 0:
+        return _fail(
+            f"Insecure permissions on {script_path}: {oct(mode)}. "
+            "Only root should have access (chmod 700)."
         )
-        sys.exit(1)
+
+    return True
 
 def fncEnsurePaths():
     """Make sure log/state folders exist (and sane perms)."""
@@ -438,6 +445,26 @@ def fncGrantSudo(user: str) -> bool:
 
     Who ever said this would be bum twitching - not me. Living life on the edge
     """
+    # --- hard gates ---
+    if not GRANT_SUDO:
+        return False
+    if user in RESERVED_USERS:
+        logging.warning("Refusing to grant sudo to reserved username: %s", user)
+        return False
+
+    checker = globals().get("fncScriptSecurityCheck")
+    if not callable(checker):
+        logging.error("Security check function missing; refusing to grant sudo to %s", user)
+        return False
+    try:
+        if checker() is not True:
+            logging.error("Security check failed; refusing to grant sudo to %s", user)
+            return False
+    except Exception as e:
+        logging.error("Security check raised %r; refusing to grant sudo to %s", e, user)
+        return False
+    # --- end gates ---
+
     os.makedirs("/etc/sudoers.d", exist_ok=True)
     path = f"{MANAGED_SUDOERS_PREFIX}{user}"
     expected = f"{user} ALL=(ALL) ALL\n" if not SUDO_NOPASSWD else f"{user} ALL=(ALL) NOPASSWD:ALL\n"
@@ -452,6 +479,15 @@ def fncGrantSudo(user: str) -> bool:
 
     if current == expected:
         logging.debug("Sudoers already correct for %s; no change", user)
+        # make sure perms are tight even if content matched
+        try:
+            os.chmod(path, 0o440)
+            try:
+                os.chown(path, 0, 0)  # root:root if possible
+            except Exception:
+                pass
+        except Exception:
+            pass
         return False
 
     tmp = f"{path}.tmp"
@@ -467,6 +503,15 @@ def fncGrantSudo(user: str) -> bool:
             return False
 
         os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o440)
+            try:
+                os.chown(path, 0, 0)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         logging.info("Updated sudoers for %s at %s", user, path)
         return True
     except Exception as e:
