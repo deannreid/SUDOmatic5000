@@ -14,7 +14,6 @@ import os
 import re
 import sys
 import json
-import shutil
 import random
 import logging
 import secrets
@@ -27,21 +26,17 @@ from colorama import Fore, Style
 from urllib import request as _urlreq, parse as _urlparse
 from urllib.error import URLError, HTTPError
 
-
-#===========#
-# Variables #
-#===========#
-VERSION = "1.3.7b"
-MIN_PYTHON_VERSION = (3, 10)
+VERSION = "1.4.0a"
+MIN_PYTHON_VERSION = (3, 11)
 ADMIN_REQUIRED = True   # yes, this needs root
 
-# --- Tweakers ---
-REALM = "SSOREALMNAME-HERE"         # Must match the Proxmox realm name exactly or shit breaks.
-DEFAULT_SHELL = "/bin/bash"         # /bin/bash ; /bin/zsh
+# --- Defaults (will be overridden by env vars below) ---
+REALM = "SSOREALMNAME-HERE"         # Must match the Proxmox realm name exactly
+DEFAULT_SHELL = "/bin/bash"         # e.g. /bin/bash or /bin/zsh
 
-EXTRA_GROUPS = ["sudo"]             # Supplementary groups (set [] if you only want sudoers files created)
-GRANT_SUDO = True                   # Per-user sudoers in /etc/sudoers.d - False only creates the user
-SUDO_NOPASSWD = False               # Keep False to require a password for sudo
+EXTRA_GROUPS = ["sudo"]             # Supplementary groups (set [] if you only want sudoers files)
+GRANT_SUDO = False                  # Per-user sudoers in /etc/sudoers.d - disabled by default 
+SUDO_NOPASSWD = False               # False = require sudo password
 
 LOG_FILE = "/var/log/sudomatic5000/thelog.log"
 STATE_DIR = "/var/lib/sudomatic5000/pve_oidc_sync"
@@ -52,10 +47,10 @@ MANAGED_SUDOERS_PREFIX = "/etc/sudoers.d/pve_realm-"
 DELETE_AFTER = timedelta(hours=24)  # How long to keep an ex-realm user locked before deletion
 PASSWORD_LENGTH = 38                # Random initial password length - Longer password means less cracking it, though its forced to reset on first login.
 
-# Only allow these UPN domains from IdProvider.
+# Only allow these UPN domains from IdProvider (empty set = block all)
 ALLOWED_UPN_DOMAINS = {"",""}
 
-# System/builtin users we will never manage (create/sudo/delete). Stand back pls.
+# System/builtin users we will never manage (create/sudo/delete)
 RESERVED_USERS = {
     "root","daemon","bin","sys","sync","games","man","lp","mail","news",
     "uucp","proxy","www-data","backup","list","irc","gnats","nobody"
@@ -81,18 +76,67 @@ BIN = {
   "getent":   "/usr/bin/getent",
 }
 
-# --- Microsoft Graph enforcement (client credentials via env vars) --- --- WORK IN PROGRESS NO WORKY
-GRAPH_ENFORCE = True            # set False if I want to ignore Graph entirely
-GRAPH_FAIL_OPEN = True          # if token/fetch fails: True = proceed without disabling extra users; False = fail closed (treat as no members)
-GRAPH_GROUP_ID = os.getenv("ENTR_SUPERUSR_ID","ENVIRONMENT VAR ENTR_TENANT_ID NOT SET")  # the group I care about
+# --- Microsoft Graph enforcement (client credentials via env vars) ---
+GRAPH_ENFORCE = True            # will be overridden by env
+GRAPH_FAIL_OPEN = True          # will be overridden by env
+GRAPH_GROUP_ID = os.getenv("ENTR_SUPERUSR_ID", "").strip()  # group to read
 GRAPH_TIMEOUT = 8               # seconds
 
 # Token via either a pre-baked access token or client creds in env (client credentials flow)
-ENV_GRAPH_ACCESS_TOKEN = os.getenv("MSFT_GRAPH_ACC_TK","ENVIRONMENT VAR MSFT_GRAPH_ACC_TK NOT SET")
+ENV_GRAPH_ACCESS_TOKEN = "GRAPH_ACCESS_TOKEN"
+ENV_MS_TENANT_ID       = "ENTR_TENANT_ID"
+ENV_MS_CLIENT_ID       = "ENTR_CLNT_ID"
+ENV_MS_CLIENT_SECRET   = "ENTR_CLNT_SEC"
 
-ENV_MS_TENANT_ID       = os.getenv("ENTR_TENANT_ID","ENVIRONMENT VAR ENTR_TENANT_ID NOT SET")
-ENV_MS_CLIENT_ID       = os.getenv("ENTR_CLNT_ID","ENVIRONMENT VAR ENTR_CLNT_ID NOT SET")
-ENV_MS_CLIENT_SECRET   = os.getenv("ENTR_CLNT_SEC","ENVIRONMENT VAR ENTR_CLNT_SEC NOT SET")
+TOKEN_ENV_FALLBACKS = [
+    ENV_GRAPH_ACCESS_TOKEN,
+    "MSFT_GRAPH_ACC_TK",
+    "MS_GRAPH_ACCESS_TOKEN",
+    "GRAPH_TOKEN",
+]
+
+# -------- env overlay helpers --------
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _env_list(name: str, default: list[str]) -> list[str]:
+    v = os.getenv(name, "")
+    if not v.strip():
+        return default
+    parts = [p.strip() for p in re.split(r"[,\s]+", v) if p.strip()]
+    return parts or default
+
+def _env_set(name: str, default: set[str]) -> set[str]:
+    v = os.getenv(name, "")
+    if not v.strip():
+        return default
+    parts = {p.strip().lower() for p in re.split(r"[,\s]+", v) if p.strip()}
+    return parts or default
+
+def _env_str(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return (v.strip() if v is not None else default)
+
+# -------- apply env overrides --------
+REALM          = _env_str ("REALM", REALM)
+DEFAULT_SHELL  = _env_str ("DEFAULT_SHELL", DEFAULT_SHELL)
+
+GRANT_SUDO     = _env_bool("GRANT_SUDO", GRANT_SUDO)
+SUDO_NOPASSWD  = _env_bool("SUDO_NOPASSWD", SUDO_NOPASSWD)
+
+# Allow overriding EXTRA_GROUPS via env: "sudo wheel" or "sudo,wheel"
+EXTRA_GROUPS   = _env_list("EXTRA_GROUPS", EXTRA_GROUPS)
+
+# Space/comma-separated; empty string means "allow all"
+ALLOWED_UPN_DOMAINS = _env_set("ALLOWED_UPN_DOMAINS", ALLOWED_UPN_DOMAINS)
+
+# Graph toggles from env/file
+GRAPH_ENFORCE  = _env_bool("GRAPH_ENFORCE", GRAPH_ENFORCE)
+GRAPH_FAIL_OPEN= _env_bool("GRAPH_FAIL_OPEN", GRAPH_FAIL_OPEN)
+GRAPH_GROUP_ID = _env_str ("ENTR_SUPERUSR_ID", GRAPH_GROUP_ID)
 
 BANNER = r"""
    _____ _    _ _____   ____  __  __       _______ _____ _____   _____  ___   ___   ___  
@@ -578,14 +622,15 @@ def fncParseISO(ts: str) -> datetime:
 #### This is still a WIP and not completed yet.... 
 def fncGraphGetToken() -> str | None:
     """
-    1) Use GRAPH_ACCESS_TOKEN if set
+    1) Use a provided bearer token (any of TOKEN_ENV_FALLBACKS)
     2) Else use client credentials (ENTR_TENANT_ID, ENTR_CLNT_ID, ENTR_CLNT_SEC)
     """
-    # Path 1: pre-baked bearer
-    token = os.getenv(ENV_GRAPH_ACCESS_TOKEN, "").strip()
-    if token:
-        logging.info("Graph: using provided bearer from %s", ENV_GRAPH_ACCESS_TOKEN)
-        return token
+    # Path 1: bearer from env
+    for name in TOKEN_ENV_FALLBACKS:
+        val = os.getenv(name, "").strip()
+        if val:
+            logging.info("Graph: using provided bearer from %s", name)
+            return val
 
     # Path 2: client credentials
     tenant = os.getenv(ENV_MS_TENANT_ID, "").strip()
@@ -593,21 +638,20 @@ def fncGraphGetToken() -> str | None:
     secret = os.getenv(ENV_MS_CLIENT_SECRET, "").strip()
 
     # Helpful debug without leaking secrets
+    def _seen(v): return "set" if v else "empty"
     logging.debug(
-        "Graph creds present? %s=%s %s=%s %s=%s",
-        ENV_MS_TENANT_ID, "yes" if tenant else "no",
-        ENV_MS_CLIENT_ID, client[:6] + "…" if client else "no",
-        ENV_MS_CLIENT_SECRET, "yes" if secret else "no",
+        "Graph env check: TENANT=%s CLIENT=%s SECRET=%s",
+        _seen(tenant), _seen(client), _seen(secret)
     )
 
     if not (tenant and client and secret):
         logging.error(
-            "Graph creds missing: set %s or (%s,%s,%s)",
-            ENV_GRAPH_ACCESS_TOKEN, ENV_MS_TENANT_ID, ENV_MS_CLIENT_ID, ENV_MS_CLIENT_SECRET
+            "Graph creds missing: set one of %s or (%s,%s,%s)",
+            ",".join(TOKEN_ENV_FALLBACKS), ENV_MS_TENANT_ID, ENV_MS_CLIENT_ID, ENV_MS_CLIENT_SECRET
         )
         return None
 
-    url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    url  = f"https://login.microsoftonline.com/{_urlparse.quote(tenant)}/oauth2/v2.0/token"
     data = _urlparse.urlencode({
         "client_id": client,
         "client_secret": secret,
@@ -618,40 +662,41 @@ def fncGraphGetToken() -> str | None:
     try:
         with _urlreq.urlopen(req, timeout=GRAPH_TIMEOUT) as resp:
             body = json.loads(resp.read().decode())
-            logging.info("Graph: obtained access token via client credentials (tenant=%s, client=%s…)",
-                         tenant, client[:6])
-            return body.get("access_token")
-    except (URLError, HTTPError) as e:
-        logging.error("Graph token fetch failed: %s", e)
+            tok = body.get("access_token")
+            if tok:
+                logging.info("Graph: obtained access token via client credentials (tenant=%s, client=%s…)",
+                             tenant, client[:6])
+                return tok
+            logging.error("Graph token response missing access_token: %s", body)
+            return None
+    except HTTPError as e:
+        # Try to pretty-print Graph JSON error
+        try:
+            err_body = e.read().decode(errors="ignore")
+            parsed = json.loads(err_body)
+            if isinstance(parsed, dict) and "error" in parsed:
+                print(json.dumps(parsed, separators=(',', ':')))
+            else:
+                print(json.dumps({
+                    "error": {
+                        "code": f"HTTP_{e.code}",
+                        "message": str(e),
+                        "innerError": {
+                            "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+                            "request-id": e.headers.get("request-id", ""),
+                            "client-request-id": e.headers.get("client-request-id", "")
+                        }
+                    }
+                }, separators=(',', ':')))
+        except Exception:
+            logging.error("Graph token HTTP %s", e.code)
+        return None
+    except URLError as e:
+        logging.error("Graph token network error: %s", e)
         return None
     except Exception as e:
         logging.error("Graph token unexpected error: %s", e)
         return None
-
-def _graph_pick_login(item: dict) -> str | None:
-    """
-    Pull userPrincipalName values from the Graph group (direct members).
-    Skips non-user objects. Handles pagination via @odata.nextLink.
-    """
-    upn = (item.get("userPrincipalName") or "").strip()
-    if upn:
-        return upn.lower()
-
-    mail = (item.get("mail") or "").strip()
-    if mail:
-        return mail.lower()
-
-    for ident in (item.get("identities") or []):
-        try:
-            if (ident.get("signInType") or "").lower() == "emailaddress":
-                addr = (ident.get("issuerAssignedId") or "").strip()
-                if addr and "@" in addr:
-                    return addr.lower()
-        except Exception:
-            continue
-
-    return None
-
 
 def fncGraphListGroupUPNs(group_id: str, token: str) -> set[str] | None:
     """

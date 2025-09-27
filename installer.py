@@ -40,7 +40,7 @@ def install_requirements():
     if REQS.exists():
         print(f"[*] Found {REQS}, installing dependencies...")
         try:
-            run(["pip3", "install", "-r", str(REQS)])
+            run(["pip3", "install", "-r", str(REQS),"--break-system-packages"])
             print("[+] Requirements installed successfully")
         except subprocess.CalledProcessError:
             print("[-] Failed to install requirements.txt")
@@ -74,55 +74,191 @@ def prompt_auth_mode() -> str:
             return "access" if choice == "1" else "application"
         print("Please enter 1 or 2.")
 
+def do_uninstall(purge: bool = False):
+    require_root()
+    print("[*] Uninstalling Sudomatic 5000...")
+
+    # Stop & disable units (ignore failures if not present)
+    for unit in ("sudomatic.timer", "sudomatic.service"):
+        try:
+            run(["systemctl", "stop", unit])
+        except subprocess.CalledProcessError:
+            pass
+        try:
+            run(["systemctl", "disable", unit])
+        except subprocess.CalledProcessError:
+            pass
+
+    # Remove unit files
+    for p in (TIMER, SERVICE):
+        try:
+            if p.exists():
+                p.unlink()
+                print(f"[+] Removed {p}")
+        except Exception as e:
+            print(f"[!] Could not remove {p}: {e}")
+
+    # Reload systemd after unit removals
+    try:
+        run(["systemctl", "daemon-reload"])
+    except subprocess.CalledProcessError:
+        pass
+
+    # Remove installed script & checker
+    for p in (SCRIPT_DST, CHECKER):
+        try:
+            if p.exists():
+                p.unlink()
+                print(f"[+] Removed {p}")
+        except Exception as e:
+            print(f"[!] Could not remove {p}: {e}")
+
+    # Remove logrotate snippet if present
+    LOGROTATE = Path("/etc/logrotate.d/sudomatic5000")
+    try:
+        if LOGROTATE.exists():
+            LOGROTATE.unlink()
+            print(f"[+] Removed {LOGROTATE}")
+    except Exception as e:
+        print(f"[!] Could not remove {LOGROTATE}: {e}")
+
+    # Optional removals
+    state_root = Path("/var/lib/sudomatic5000")  # parent of pve_oidc_sync
+    targets = [
+        ("env file", ENVFILE),
+        ("log dir", LOGDIR),
+        ("state dir", state_root),
+    ]
+
+    def ask(q: str) -> bool:
+        a = input(q + " [y/N]: ").strip().lower()
+        return a in ("y", "yes")
+
+    if purge:
+        for label, path in targets:
+            try:
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                print(f"[+] Purged {label}: {path}")
+            except Exception as e:
+                print(f"[!] Failed to purge {label} {path}: {e}")
+    else:
+        for label, path in targets:
+            try:
+                if path.exists() and ask(f"Remove {label} {path}?"):
+                    if path.is_file():
+                        path.unlink()
+                    else:
+                        shutil.rmtree(path, ignore_errors=True)
+                    print(f"[+] Removed {label}: {path}")
+            except Exception as e:
+                print(f"[!] Failed to remove {label} {path}: {e}")
+
+    print("[+] Uninstall complete.")
+    print("[i] If you re-install later, re-run: systemctl daemon-reload && systemctl enable --now sudomatic.timer")
+
+
 def build_envfile_content() -> str:
     """
-    Ask whether to use Graph or PVE-only.
-    If Graph: ask auth mode + gather variables. Always include ENTR_SUPERUSR_ID when Graph is on.
+    Build /etc/sudomatic5000.env content:
+    - Runtime: REALM, DEFAULT_SHELL, GRANT_SUDO, SUDO_NOPASSWD, ALLOWED_UPN_DOMAINS
+    - Membership source: Graph vs PVE-only (and Graph auth details)
     """
-    use_graph = prompt_use_graph()
+    import re
+    from getpass import getpass
+
+    # ---- tiny inline helpers (keep installer.py tidy) ----
+    def ask_bool(q: str, default: bool = True) -> bool:
+        hint = "Y/n" if default else "y/N"
+        while True:
+            a = input(f"{q} [{hint}]: ").strip().lower()
+            if not a:
+                return default
+            if a in ("y", "yes"):
+                return True
+            if a in ("n", "no"):
+                return False
+            print("Please answer y or n.")
+
+    def ask_nonempty(q: str, default: str | None = None) -> str:
+        while True:
+            prompt = f"{q}{f' [{default}]' if default else ''}: "
+            a = input(prompt).strip()
+            if a:
+                return a
+            if default is not None:
+                return default
+            print("Value cannot be empty.")
+
+    def ask_domains() -> str:
+        """
+        Ask for allowed UPN domains; returns a single space-separated string.
+        Empty input means 'allow all'.
+        """
+        raw = input("Allowed UPN domains (space/comma-separated, empty = allow all): ").strip()
+        if not raw:
+            return ""
+        parts = [p.strip().lower() for p in re.split(r"[,\s]+", raw) if p.strip()]
+        return " ".join(sorted(set(parts)))
+
+    # ---- runtime basics ----
+    print("\n== Sudomatic 5000 — Runtime configuration ==")
+    realm = ask_nonempty("Proxmox Realm name (must match PVE exactly)")
+    shell = ask_nonempty("Default shell for new users", default="/bin/bash")
+    grant_sudo = ask_bool("Automatically grant sudo to new users?", default=True)
+    sudo_nopasswd = False
+    if grant_sudo:
+        sudo_nopasswd = ask_bool("Use NOPASSWD for sudo?", default=False)
+    domains = ask_domains()  # "" => no filtering
+
     lines = [
         "# Autogenerated by Sudomatic installer",
         "# Keep this file 0600, owner root",
+        "",
+        f"REALM={sh_quote(realm)}",
+        f"DEFAULT_SHELL={sh_quote(shell)}",
+        f"GRANT_SUDO={'true' if grant_sudo else 'false'}",
+        f"SUDO_NOPASSWD={'true' if sudo_nopasswd else 'false'}",
+        f"ALLOWED_UPN_DOMAINS={sh_quote(domains)}",  # space-separated list or empty
+        "",
     ]
 
+    # ---- membership source ----
+    use_graph = prompt_use_graph()
     if not use_graph:
-        # PVE-only mode
         lines += [
             "GRAPH_ENFORCE='false'",
-            "GRAPH_FAIL_OPEN='true'",  # irrelevant in this mode, but harmless
+            "GRAPH_FAIL_OPEN='true'",  # harmless here
             "# ENTR_SUPERUSR_ID=''     # not used when GRAPH_ENFORCE=false",
             "# GRAPH_ACCESS_TOKEN=''   # not used when GRAPH_ENFORCE=false",
             "# ENTR_TENANT_ID=''       # not used when GRAPH_ENFORCE=false",
             "# ENTR_CLNT_ID=''         # not used when GRAPH_ENFORCE=false",
             "# ENTR_CLNT_SEC=''        # not used when GRAPH_ENFORCE=false",
         ]
-        # Optional domain allow-list placeholder; user can edit later
-        lines.append("# ALLOWED_UPN_DOMAINS='domain.com anotherdomain.com'")
         return "\n".join(lines) + "\n"
 
-    # Graph enforcement path
+    # ---- Graph enforcement path ----
     lines.append("GRAPH_ENFORCE='true'")
 
-    group_id = input("\nGraph Group ID (ENTR_SUPERUSR_ID) [required]: ").strip()
-    while not group_id:
-        group_id = input("Graph Group ID cannot be empty. Enter ENTR_SUPERUSR_ID: ").strip()
+    group_id = ask_nonempty("\nGraph Group ID (ENTR_SUPERUSR_ID)")
     lines.append(f"ENTR_SUPERUSR_ID={sh_quote(group_id)}")
 
-    fail_open = input("Fail OPEN if Graph is unavailable? [Y/n]: ").strip().lower()
-    fail_open_val = "true" if fail_open in ("", "y", "yes") else "false"
-    lines.append(f"GRAPH_FAIL_OPEN={sh_quote(fail_open_val)}")
+    fail_open = ask_bool("Fail OPEN if Graph is unavailable?", default=True)
+    lines.append(f"GRAPH_FAIL_OPEN={sh_quote('true' if fail_open else 'false')}")
 
     mode = prompt_auth_mode()
     if mode == "access":
         print("\nYou chose Access Token mode.")
-        print("Note: Delegated tokens are short-lived (~1 hour). Good for testing; not ideal for the timer.")
-        token = getpass("Paste GRAPH_ACCESS_TOKEN (optional, input hidden): ").strip()
+        print("Note: Delegated tokens are short-lived (~1 hour). Good for testing; less ideal for timers.")
+        token = getpass("Paste GRAPH_ACCESS_TOKEN (input hidden, can be empty): ").strip()
         lines.append(f"GRAPH_ACCESS_TOKEN={sh_quote(token)}")
         lines.append("AUTH_MODE='access'")
     else:
         print("\nYou chose Application Tokens (client credentials).")
-        tenant = input("ENTR_TENANT_ID (Tenant ID GUID): ").strip()
-        client = input("ENTR_CLNT_ID (App / Client ID GUID): ").strip()
+        tenant = ask_nonempty("ENTR_TENANT_ID (Tenant ID GUID)")
+        client = ask_nonempty("ENTR_CLNT_ID (App / Client ID GUID)")
         secret = getpass("ENTR_CLNT_SEC (Client Secret) [input hidden]: ").strip()
         lines += [
             f"ENTR_TENANT_ID={sh_quote(tenant)}",
@@ -131,8 +267,6 @@ def build_envfile_content() -> str:
             "AUTH_MODE='application'",
         ]
 
-    # Optional domain allow-list placeholder; user can edit later
-    lines.append("# ALLOWED_UPN_DOMAINS='domain.com anotherdomain.com'")
     return "\n".join(lines) + "\n"
 
 def write_envfile(content: str):
@@ -272,14 +406,17 @@ def do_update(auto_restart=False):
 
 def main():
     parser = argparse.ArgumentParser(description="Installer/Updater for Sudomatic 5000")
-    parser.add_argument("action", choices=["install", "update"], help="Action to perform")
+    parser.add_argument("action", choices=["install", "update", "uninstall"], help="Action to perform")
     parser.add_argument("--restart", action="store_true", help="Auto-restart service after update")
+    parser.add_argument("--purge", action="store_true", help="Remove env, logs, and state without prompts (DANGEROUS)")
     args = parser.parse_args()
 
     if args.action == "install":
         do_install()
     elif args.action == "update":
         do_update(auto_restart=args.restart)
+    elif args.action == "uninstall":
+        do_uninstall(purge=args.purge)
 
 if __name__ == "__main__":
     main()
