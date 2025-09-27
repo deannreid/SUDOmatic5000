@@ -5,30 +5,38 @@
 Sync OIDC users from **Proxmox VE** into real **Linux** accounts: create local users, set a random (expired) password, manage groups/sudoers idempotently, and handle removals (lock → delete after 24h). Logs live at `/var/log/sudomatic5000/thelog.log`. Safe-by-default: reserved accounts are never touched, binaries are pinned, and runs are lockfile-protected.
 
 ---
-## ⚠️ Casual Cyber Warning.
-> **This script will refuse to start unless the file is owned by `root:root` and has permissions `0700`.** 
-> That’s intentional, don't remove this code from the script: when run automatically, a misconfigured copy of this script could let **anyone** drop/modify it and thereby create **full sudo accounts** on the box.
+Here’s an updated **Casual Cyber Warning** block with the checksum bit baked in:
+
+---
+
+## ⚠️ Casual Cyber Warning
+
+> **This script will refuse to start unless it’s `root:root` and `0700`.**
+> That’s intentional—so nobody can swap it and mint sudo. The service also uses an **ExecCondition checksum guard**: `/usr/local/sbin/sudomatic_check.sh` verifies the **SHA-256** of `/usr/local/sbin/sudomatic5000.py` captured at install/update.
+> **If the file changes on disk, the checksum fails and the service will not run.**
 >
 > **Before enabling the service or timer, enforce correct ownership and permissions:**
 >
 > ```bash
-> sudo chown root:root /usr/local/sbin/sudomatic5000.py
-> sudo chown root:root /usr/local/sbin/sudomatic_check.sh
->
-> sudo chmod 700 /usr/local/sbin/sudomatic5000.py
-> sudo chmod 700 /usr/local/sbin/sudomatic_check.sh
+> sudo chown root:root /usr/local/sbin/sudomatic5000.py /usr/local/sbin/sudomatic_check.sh
+> sudo chmod 700        /usr/local/sbin/sudomatic5000.py /usr/local/sbin/sudomatic_check.sh
+> sudo install -d -m 0750 -o root -g root /var/log/sudomatic5000
+> sudo install -d -m 0750 -o root -g root /var/lib/sudomatic5000
 > ```
 >
-> **Also ensure the service runs as root and paths aren’t world-writable:**
+> **Service must run as root** and paths must not be world-writable. Never place the script in user-writable locations (`/tmp`, `$HOME`, shared mounts, etc.).
 >
-> * systemd unit must specify `User=root`
-> * log dir: `sudo install -d -m 0750 -o root -g root /var/log/sudomatic5000`
-> * state dir: `sudo install -d -m 0750 -o root -g root /var/lib/sudomatic5000`
-> * never place the script in user-writable locations (`/tmp`, `$HOME`, shared mounts, etc.)
+> **Need to change the code?** Do **not** edit the installed file directly. Update from your repo and let the installer refresh the checksum:
 >
-> If ownership/permissions don’t match, the script **actively exits** to prevent privilege-escalation via file tampering.
+> ```bash
+> # replace sudomatic5000.py in your repo working dir, then:
+> sudo ./installer.py update --restart
+> ```
+>
+> If ownership, permissions, or checksum don’t match, the script **actively exits** to prevent privilege-escalation via file tampering.
 
 ---
+
 
 ## Quick start
 
