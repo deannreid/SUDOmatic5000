@@ -14,7 +14,6 @@ import os
 import re
 import sys
 import json
-import shutil
 import random
 import logging
 import secrets
@@ -24,21 +23,20 @@ import stat
 import fcntl
 from datetime import datetime, timedelta, timezone
 from colorama import Fore, Style
+from urllib import request as _urlreq, parse as _urlparse
+from urllib.error import URLError, HTTPError
 
-#===========#
-# Variables #
-#===========#
-VERSION = "1.3.5"
-MIN_PYTHON_VERSION = (3, 10)
+VERSION = "1.4.0a"
+MIN_PYTHON_VERSION = (3, 11)
 ADMIN_REQUIRED = True   # yes, this needs root
 
-# --- Tweakers ---
-REALM = "SSOREALMNAME-HERE"         # Must match the Proxmox realm name exactly or shit breaks.
-DEFAULT_SHELL = "/bin/bash"         # /bin/bash ; /bin/zsh
+# --- Defaults (will be overridden by env vars below) ---
+REALM = "SSOREALMNAME-HERE"         # Must match the Proxmox realm name exactly
+DEFAULT_SHELL = "/bin/bash"         # e.g. /bin/bash or /bin/zsh
 
-EXTRA_GROUPS = ["sudo"]             # Supplementary groups (set [] if you only want sudoers files created)
-GRANT_SUDO = True                   # Per-user sudoers in /etc/sudoers.d - False only creates the user
-SUDO_NOPASSWD = False               # Keep False to require a password for sudo
+EXTRA_GROUPS = ["sudo"]             # Supplementary groups (set [] if you only want sudoers files)
+GRANT_SUDO = False                  # Per-user sudoers in /etc/sudoers.d - disabled by default 
+SUDO_NOPASSWD = False               # False = require sudo password
 
 LOG_FILE = "/var/log/sudomatic5000/thelog.log"
 STATE_DIR = "/var/lib/sudomatic5000/pve_oidc_sync"
@@ -49,10 +47,10 @@ MANAGED_SUDOERS_PREFIX = "/etc/sudoers.d/pve_realm-"
 DELETE_AFTER = timedelta(hours=24)  # How long to keep an ex-realm user locked before deletion
 PASSWORD_LENGTH = 38                # Random initial password length - Longer password means less cracking it, though its forced to reset on first login.
 
-# Only allow these UPN domains from IdProvider.
+# Only allow these UPN domains from IdProvider (empty set = block all)
 ALLOWED_UPN_DOMAINS = {"",""}
 
-# System/builtin users we will never manage (create/sudo/delete). Stand back pls.
+# System/builtin users we will never manage (create/sudo/delete)
 RESERVED_USERS = {
     "root","daemon","bin","sys","sync","games","man","lp","mail","news",
     "uucp","proxy","www-data","backup","list","irc","gnats","nobody"
@@ -78,18 +76,67 @@ BIN = {
   "getent":   "/usr/bin/getent",
 }
 
-# --- Microsoft Graph enforcement (client credentials via env vars) --- --- WORK IN PROGRESS NO WORKY
-GRAPH_ENFORCE = True            # set False if I want to ignore Graph entirely
-GRAPH_FAIL_OPEN = True          # if token/fetch fails: True = proceed without disabling extra users; False = fail closed (treat as no members)
-GRAPH_GROUP_ID = "GROUP_ID_HERE"  # the group I care about
+# --- Microsoft Graph enforcement (client credentials via env vars) ---
+GRAPH_ENFORCE = True            # will be overridden by env
+GRAPH_FAIL_OPEN = True          # will be overridden by env
+GRAPH_GROUP_ID = os.getenv("ENTR_SUPERUSR_ID", "").strip()  # group to read
 GRAPH_TIMEOUT = 8               # seconds
 
 # Token via either a pre-baked access token or client creds in env (client credentials flow)
 ENV_GRAPH_ACCESS_TOKEN = "GRAPH_ACCESS_TOKEN"
+ENV_MS_TENANT_ID       = "ENTR_TENANT_ID"
+ENV_MS_CLIENT_ID       = "ENTR_CLNT_ID"
+ENV_MS_CLIENT_SECRET   = "ENTR_CLNT_SEC"
 
-ENV_MS_TENANT_ID       = "MS_TENANT_ID"
-ENV_MS_CLIENT_ID       = "MS_CLIENT_ID"
-ENV_MS_CLIENT_SECRET   = "MS_CLIENT_SECRET"
+TOKEN_ENV_FALLBACKS = [
+    ENV_GRAPH_ACCESS_TOKEN,
+    "MSFT_GRAPH_ACC_TK",
+    "MS_GRAPH_ACCESS_TOKEN",
+    "GRAPH_TOKEN",
+]
+
+# -------- env overlay helpers --------
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _env_list(name: str, default: list[str]) -> list[str]:
+    v = os.getenv(name, "")
+    if not v.strip():
+        return default
+    parts = [p.strip() for p in re.split(r"[,\s]+", v) if p.strip()]
+    return parts or default
+
+def _env_set(name: str, default: set[str]) -> set[str]:
+    v = os.getenv(name, "")
+    if not v.strip():
+        return default
+    parts = {p.strip().lower() for p in re.split(r"[,\s]+", v) if p.strip()}
+    return parts or default
+
+def _env_str(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return (v.strip() if v is not None else default)
+
+# -------- apply env overrides --------
+REALM          = _env_str ("REALM", REALM)
+DEFAULT_SHELL  = _env_str ("DEFAULT_SHELL", DEFAULT_SHELL)
+
+GRANT_SUDO     = _env_bool("GRANT_SUDO", GRANT_SUDO)
+SUDO_NOPASSWD  = _env_bool("SUDO_NOPASSWD", SUDO_NOPASSWD)
+
+# Allow overriding EXTRA_GROUPS via env: "sudo wheel" or "sudo,wheel"
+EXTRA_GROUPS   = _env_list("EXTRA_GROUPS", EXTRA_GROUPS)
+
+# Space/comma-separated; empty string means "allow all"
+ALLOWED_UPN_DOMAINS = _env_set("ALLOWED_UPN_DOMAINS", ALLOWED_UPN_DOMAINS)
+
+# Graph toggles from env/file
+GRAPH_ENFORCE  = _env_bool("GRAPH_ENFORCE", GRAPH_ENFORCE)
+GRAPH_FAIL_OPEN= _env_bool("GRAPH_FAIL_OPEN", GRAPH_FAIL_OPEN)
+GRAPH_GROUP_ID = _env_str ("ENTR_SUPERUSR_ID", GRAPH_GROUP_ID)
 
 BANNER = r"""
    _____ _    _ _____   ____  __  __       _______ _____ _____   _____  ___   ___   ___  
@@ -157,36 +204,29 @@ BLURBS = [
 # Purpose : Ensure script is only executed by root and has safe perms
 # Notes   : Exits with warning if insecure
 # ================================================================
-def fncScriptSecurityCheck(exit_on_fail: bool = False) -> bool:
-    def _fail(msg: str) -> bool:
-        logging.critical("SECURITY: %s", msg)
-        if exit_on_fail:
-            sys.exit(1)
-        return False
-
-    try:
-        script_path = os.path.realpath(__file__)
-        st = os.stat(script_path)
-    except Exception as e:
-        return _fail(f"Cannot stat script: {e}")
+def fncScriptSecurityCheck():
+    script_path = os.path.realpath(__file__)
+    st = os.stat(script_path)
 
     # 1. Must be executed as root
     if os.geteuid() != 0:
-        return _fail("This script must be run as root.")
+        fncPrintMessage("This script must be run as root.", "error")
+        sys.exit(1)
 
     # 2. Must be owned by root
     if st.st_uid != 0:
-        return _fail(f"Script must be owned by root (uid=0). Found uid={st.st_uid}.")
+        fncPrintMessage("Script must be owned by root.", "error")
+        sys.exit(1)
 
     # 3. Permissions must not allow group/others ANY access
-    mode = st.st_mode & 0o777
-    if (mode & 0o077) != 0:
-        return _fail(
-            f"Insecure permissions on {script_path}: {oct(mode)}. "
-            "Only root should have access (chmod 700)."
+    bad_perms = stat.S_IRWXG | stat.S_IRWXO
+    if st.st_mode & bad_perms:
+        fncPrintMessage(
+            f"Insecure permissions on {script_path}. "
+            "Only root should have access (chmod 700).",
+            "error"
         )
-
-    return True
+        sys.exit(1)
 
 def fncEnsurePaths():
     """Make sure log/state folders exist (and sane perms)."""
@@ -272,6 +312,25 @@ def fncAcquireLock():
     _LOCK_FH = open(LOCK_PATH, "w")
     fcntl.lockf(_LOCK_FH, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
+def _graph_print_error(code: str, message: str,
+                       request_id: str | None = None,
+                       client_request_id: str | None = None,
+                       when: str | None = None):
+    if when is None:
+        when = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    err = {
+        "error": {
+            "code": code,
+            "message": message,
+            "innerError": {
+                "date": when,
+                "request-id": request_id or "",
+                "client-request-id": client_request_id or ""
+            }
+        }
+    }
+    print(json.dumps(err, separators=(',', ':')))
+
 #====================#
 # Proxmox OIDC sync  #
 #====================#
@@ -301,7 +360,6 @@ def fncRun(cmdkey: str, args: list[str] | None = None, input: str | None = None)
         return p.returncode, p.stdout.strip(), p.stderr.strip()
     except FileNotFoundError as e:
         return 127, "", str(e)
-
 
 def fncGetPveUsersForRealm(realm: str) -> set[str]:
     """Pull PVE users, filter by my realm and allowed UPN domains, map to local usernames."""
@@ -443,15 +501,12 @@ def fncGrantSudo(user: str) -> bool:
     Ensure /etc/sudoers.d/<file> has exactly what I want.
     Writes only if content differs; validates with visudo first.
 
-    Who ever said this would be bum twitching - not me. Living life on the edge
-    """
-    # --- hard gates ---
-    if not GRANT_SUDO:
-        return False
-    if user in RESERVED_USERS:
-        logging.warning("Refusing to grant sudo to reserved username: %s", user)
-        return False
-
+    Safety gate:
+        - If fncScriptSecurityCheck() is missing, returns False, or raises,
+            we refuse to grant sudo. Standard user only.
+        Who ever said this would be bum twitching - not me. Living life on the edge
+        """
+    # --- Security gate ---
     checker = globals().get("fncScriptSecurityCheck")
     if not callable(checker):
         logging.error("Security check function missing; refusing to grant sudo to %s", user)
@@ -461,9 +516,12 @@ def fncGrantSudo(user: str) -> bool:
             logging.error("Security check failed; refusing to grant sudo to %s", user)
             return False
     except Exception as e:
-        logging.error("Security check raised %r; refusing to grant sudo to %s", e, user)
+        logging.error("Security check raised %s; refusing to grant sudo to %s", repr(e), user)
         return False
-    # --- end gates ---
+    # --- end gate ---
+
+    if not GRANT_SUDO:
+        return False
 
     os.makedirs("/etc/sudoers.d", exist_ok=True)
     path = f"{MANAGED_SUDOERS_PREFIX}{user}"
@@ -479,15 +537,6 @@ def fncGrantSudo(user: str) -> bool:
 
     if current == expected:
         logging.debug("Sudoers already correct for %s; no change", user)
-        # make sure perms are tight even if content matched
-        try:
-            os.chmod(path, 0o440)
-            try:
-                os.chown(path, 0, 0)  # root:root if possible
-            except Exception:
-                pass
-        except Exception:
-            pass
         return False
 
     tmp = f"{path}.tmp"
@@ -503,15 +552,6 @@ def fncGrantSudo(user: str) -> bool:
             return False
 
         os.replace(tmp, path)
-        try:
-            os.chmod(path, 0o440)
-            try:
-                os.chown(path, 0, 0)
-            except Exception:
-                pass
-        except Exception:
-            pass
-
         logging.info("Updated sudoers for %s at %s", user, path)
         return True
     except Exception as e:
@@ -582,23 +622,36 @@ def fncParseISO(ts: str) -> datetime:
 #### This is still a WIP and not completed yet.... 
 def fncGraphGetToken() -> str | None:
     """
-    Get a Graph access token from:
-    1) GRAPH_ACCESS_TOKEN env (already a bearer)
-    2) client credentials in env -> fetch a token
+    1) Use a provided bearer token (any of TOKEN_ENV_FALLBACKS)
+    2) Else use client credentials (ENTR_TENANT_ID, ENTR_CLNT_ID, ENTR_CLNT_SEC)
     """
-    token = os.getenv(ENV_GRAPH_ACCESS_TOKEN, "").strip()
-    if token:
-        return token
+    # Path 1: bearer from env
+    for name in TOKEN_ENV_FALLBACKS:
+        val = os.getenv(name, "").strip()
+        if val:
+            logging.info("Graph: using provided bearer from %s", name)
+            return val
 
+    # Path 2: client credentials
     tenant = os.getenv(ENV_MS_TENANT_ID, "").strip()
     client = os.getenv(ENV_MS_CLIENT_ID, "").strip()
     secret = os.getenv(ENV_MS_CLIENT_SECRET, "").strip()
+
+    # Helpful debug without leaking secrets
+    def _seen(v): return "set" if v else "empty"
+    logging.debug(
+        "Graph env check: TENANT=%s CLIENT=%s SECRET=%s",
+        _seen(tenant), _seen(client), _seen(secret)
+    )
+
     if not (tenant and client and secret):
-        logging.error("Graph creds missing: set %s or (%s,%s,%s)",
-                      ENV_GRAPH_ACCESS_TOKEN, ENV_MS_TENANT_ID, ENV_MS_CLIENT_ID, ENV_MS_CLIENT_SECRET)
+        logging.error(
+            "Graph creds missing: set one of %s or (%s,%s,%s)",
+            ",".join(TOKEN_ENV_FALLBACKS), ENV_MS_TENANT_ID, ENV_MS_CLIENT_ID, ENV_MS_CLIENT_SECRET
+        )
         return None
 
-    url = f"https://login.microsoftonline.com/{_urlparse.quote(tenant)}/oauth2/v2.0/token"
+    url  = f"https://login.microsoftonline.com/{_urlparse.quote(tenant)}/oauth2/v2.0/token"
     data = _urlparse.urlencode({
         "client_id": client,
         "client_secret": secret,
@@ -609,66 +662,144 @@ def fncGraphGetToken() -> str | None:
     try:
         with _urlreq.urlopen(req, timeout=GRAPH_TIMEOUT) as resp:
             body = json.loads(resp.read().decode())
-            return body.get("access_token")
-    except (URLError, HTTPError) as e:
-        logging.error("Graph token fetch failed: %s", e)
+            tok = body.get("access_token")
+            if tok:
+                logging.info("Graph: obtained access token via client credentials (tenant=%s, client=%s…)",
+                             tenant, client[:6])
+                return tok
+            logging.error("Graph token response missing access_token: %s", body)
+            return None
+    except HTTPError as e:
+        # Try to pretty-print Graph JSON error
+        try:
+            err_body = e.read().decode(errors="ignore")
+            parsed = json.loads(err_body)
+            if isinstance(parsed, dict) and "error" in parsed:
+                print(json.dumps(parsed, separators=(',', ':')))
+            else:
+                print(json.dumps({
+                    "error": {
+                        "code": f"HTTP_{e.code}",
+                        "message": str(e),
+                        "innerError": {
+                            "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+                            "request-id": e.headers.get("request-id", ""),
+                            "client-request-id": e.headers.get("client-request-id", "")
+                        }
+                    }
+                }, separators=(',', ':')))
+        except Exception:
+            logging.error("Graph token HTTP %s", e.code)
+        return None
+    except URLError as e:
+        logging.error("Graph token network error: %s", e)
         return None
     except Exception as e:
         logging.error("Graph token unexpected error: %s", e)
         return None
 
-def fncGraphListGroupUPNs(group_id: str, token: str) -> set[str]:
+def fncGraphListGroupUPNs(group_id: str, token: str) -> set[str] | None:
     """
-    Pull userPrincipalName values from the Graph group (direct members).
-    Skips non-user objects. Handles pagination via @odata.nextLink.
+    Return a set of userPrincipalName values for *user* members only.
+    - No fallbacks (mail/identities) — strictly UPN.
+    - Skips members with missing/empty UPN and logs a warning.
+    - On HTTP/network error: prints one Graph-style JSON error and returns None
+      so the caller can fail-open (no user add/remove/lock this run).
     """
     if not token:
-        return set()
+        _graph_print_error("InvalidAuthenticationToken", "No access token provided.", None, None)
+        logging.warning("Graph: no token; proceeding without enforcement (fail-open).")
+        return None
 
+    client_req_id = secrets.token_hex(16)
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
+        "client-request-id": client_req_id,
     }
-    # select just what we need; $top large-ish to reduce pages
-    url = f"https://graph.microsoft.com/v1.0/groups/{group_id}/members?$select=userPrincipalName,accountEnabled&$top=999"
+
+    # Best-effort group meta for nicer logs (don’t print JSON if this fails)
+    g_name, g_mail = group_id, "-"
+    try:
+        meta_req = _urlreq.Request(
+            f"https://graph.microsoft.com/v1.0/groups/{group_id}?$select=id,displayName,mail",
+            headers=headers
+        )
+        with _urlreq.urlopen(meta_req, timeout=GRAPH_TIMEOUT) as r:
+            meta = json.loads(r.read().decode())
+        g_name = meta.get("displayName") or group_id
+        g_mail = meta.get("mail") or "-"
+    except Exception:
+        pass
+
+    # Only users; request only what we need for strict UPN
+    url = (f"https://graph.microsoft.com/v1.0/groups/{group_id}"
+           f"/members/microsoft.graph.user?$select=id,displayName,userPrincipalName&$top=999")
 
     upns: set[str] = set()
+    pages = 0
+    missing_upn_ids: list[str] = []
+    domain_filtered = 0
+
+    # Optional domain allow-list (ignore blanks like "" in config)
+    allowed_domains = {d.strip().lower() for d in ALLOWED_UPN_DOMAINS if d and d.strip()}
+
     while url:
-        req = _urlreq.Request(url, headers=headers)
         try:
+            req = _urlreq.Request(url, headers=headers)
             with _urlreq.urlopen(req, timeout=GRAPH_TIMEOUT) as resp:
                 doc = json.loads(resp.read().decode())
         except HTTPError as e:
-            logging.error("Graph members fetch HTTP %s: %s", e.code, e)
-            break
-        except URLError as e:
-            logging.error("Graph members fetch network error: %s", e)
-            break
-        except Exception as e:
-            logging.error("Graph members unexpected error: %s", e)
-            break
+            rid = e.headers.get("request-id") or e.headers.get("x-ms-request-id")
+            # Print Graph’s own error JSON if present; else synthesize one line
+            try:
+                body = e.read().decode(errors="ignore")
+                parsed = json.loads(body)
+                if isinstance(parsed, dict) and "error" in parsed:
+                    print(json.dumps(parsed, separators=(',', ':')))
+                else:
+                    _graph_print_error(f"HTTP_{e.code}", str(e), rid, client_req_id)
+            except Exception:
+                _graph_print_error(f"HTTP_{e.code}", str(e), rid, client_req_id)
+            logging.warning("Graph failed; no user changes this run (fail-open).")
+            return None
+        except (URLError, Exception) as e:
+            _graph_print_error("ServiceUnavailable", str(e), None, client_req_id)
+            logging.warning("Graph unavailable (%s); no user changes this run (fail-open).", e)
+            return None
 
+        pages += 1
         for item in doc.get("value", []):
-            upn = item.get("userPrincipalName")
-            if not upn:
-                continue  # not a user (service principal / group / device)
-            upn = upn.strip()
-            if not upn:
+            raw_upn = (item.get("userPrincipalName") or "").strip()
+            if not raw_upn:
+                # real user object but no UPN — skip per your requirement
+                missing_upn_ids.append(item.get("id") or "?")
                 continue
-            # domain allow-list (defence-in-depth)
-            dom = upn.split("@", 1)[-1].lower() if "@" in upn else ""
-            if dom not in ALLOWED_UPN_DOMAINS:
-                continue
-            upns.add(upn.lower())
+
+            upn = raw_upn.lower()
+            if allowed_domains:
+                dom = upn.split("@", 1)[-1]
+                if dom not in allowed_domains:
+                    domain_filtered += 1
+                    continue
+
+            upns.add(upn)
 
         url = doc.get("@odata.nextLink")
 
+    if missing_upn_ids:
+        sample = ", ".join(missing_upn_ids[:10])
+        more = "" if len(missing_upn_ids) <= 10 else f" …(+{len(missing_upn_ids)-10} more)"
+        logging.warning("Graph: %d user member(s) missing userPrincipalName in '%s' — skipped: %s%s",
+                        len(missing_upn_ids), g_name, sample, more)
+
+    logging.info("Graph: group '%s' (%s) members fetched (STRICT UPN): kept=%d, domain_filtered=%d, pages=%d",
+                 g_name, g_mail, len(upns), domain_filtered, pages)
     return upns
 
 #====================#
 # Sync logic         #
 #====================#
-
 
 def fncSync():
     """Main reconciliation loop. Keep it boring and predictable."""
@@ -684,20 +815,21 @@ def fncSync():
     if GRAPH_ENFORCE:
         token = fncGraphGetToken()
         if token:
-            group_upns = fncGraphListGroupUPNs(GRAPH_GROUP_ID, token)
-            allowed_unix = { fncUpnToUnix(upn) for upn in group_upns }
-            before = set(desired)
-            desired = desired & allowed_unix
-            dropped = sorted(before - desired)
-            if dropped:
-                logging.info("Graph enforcement: excluding users not in group: %s", dropped)
-        else:
-            msg = "Graph enforcement skipped: token unavailable"
-            if GRAPH_FAIL_OPEN:
-                logging.warning(msg + " (fail-open)")
+            allowed = fncGraphListGroupUPNs(GRAPH_GROUP_ID, token)
+            if allowed is None:
+                # Graph request failed - DO NOT lock/disable anyone; keep previous behaviour
+                logging.warning("Graph error: proceeding without enforcement (fail-open).")
+                fncPrintMessage("Graph error: proceeding without enforcement (fail-open).", "error")
             else:
-                logging.error(msg + " (fail-closed -> no members)")
-                desired = set()
+                before = set(desired)
+                allowed_unix = {fncUpnToUnix(u) for u in allowed}
+                desired = before & allowed_unix
+                dropped = sorted(before - desired)
+                if dropped:
+                    logging.info("Graph enforcement: excluding users not in group: %s", dropped)
+        else:
+            logging.warning("Graph token unavailable: proceeding without enforcement (fail-open).")
+
 
     state = fncLoadState()
     known = set(state.get("known_users", []))
@@ -780,7 +912,7 @@ def fncSync():
 
 def fncMain():
     try:
-        #fncScriptSecurityCheck()
+        fncScriptSecurityCheck()
         fncAdminCheck()
         fncSetupLogging()
         fncAcquireLock()
