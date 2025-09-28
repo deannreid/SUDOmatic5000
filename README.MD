@@ -5,10 +5,6 @@
 Sync OIDC users from **Proxmox VE** into real **Linux** accounts: create local users, set a random (expired) password, manage groups/sudoers idempotently, and handle removals (lock → delete after 24h). Logs live at `/var/log/sudomatic5000/thelog.log`. Safe-by-default: reserved accounts are never touched, binaries are pinned, and runs are lockfile-protected.
 
 ---
-Here’s an updated **Casual Cyber Warning** block with the checksum bit baked in:
-
----
-
 ## ⚠️ Casual Cyber Warning
 
 > **This script will refuse to start unless it’s `root:root` and `0700`.**
