@@ -138,63 +138,6 @@ GRAPH_ENFORCE  = _env_bool("GRAPH_ENFORCE", GRAPH_ENFORCE)
 GRAPH_FAIL_OPEN= _env_bool("GRAPH_FAIL_OPEN", GRAPH_FAIL_OPEN)
 GRAPH_GROUP_ID = _env_str ("ENTR_SUPERUSR_ID", GRAPH_GROUP_ID)
 
-BANNER = r"""
-   _____ _    _ _____   ____  __  __       _______ _____ _____   _____  ___   ___   ___  
-  / ____| |  | |  __ \ / __ \|  \/  |   /\|__   __|_   _/ ____| | ____|/ _ \ / _ \ / _ \ 
- | (___ | |  | | |  | | |  | | \  / |  /  \  | |    | || |      | |__ | | | | | | | | | |
-  \___ \| |  | | |  | | |  | | |\/| | / /\ \ | |    | || |      |___ \| | | | | | | | | |
-  ____) | |__| | |__| | |__| | |  | |/ ____ \| |   _| || |____   ___) | |_| | |_| | |_| |
- |_____/ \____/|_____/ \____/|_|  |_/_/    \_\_|  |_____\_____| |____/ \___/ \___/ \___/ 
-                Turning realms into real users, one sudo at a time.
-                ------------------------------------------------
-                ::        %INSERT RELEVANT DISCORD HERE       ::
-                :: https://github.com/deannreid/SUDOmatic5000 ::
-                ------------------------------------------------
-"""
-
-VERSION_INFO = f"""
-==============================================
-| Deano's Sudomatic 5000                      |
-| Version: {VERSION}                          |
-|                                             |
-| Syncs Proxmox OIDC users to local Linux:    |
-| creates accounts with expired random        |
-| passwords, manages groups/sudoers           |
-| locks & deletes after 24h,                  |
-| logs changes to log for siem tracking.      |
-==============================================
-| Script Information:                         |
-| Proxmox OIDC > Unix user sync               |
-==============================================
-| Updates:                                    |
-| 20/08/2025: Initial Code from Boilerplate   |
-|             Added code to do code things    |
-|             Cleanup imports, no pwd/grp     |
-| 21/08/2025: Pinned bins, lockfile,          |
-|             reserved users, domain filter,  |
-|             sudo allow-list, logrotate.     |
-==============================================
-"""
-
-BLURBS = [
-    "Summoning realm users: Because PVE doesn't believe in magic.\n",
-    "Forging Unix accounts: Turning corporate IDs into shiny new shells.\n",
-    "Bestowing sudo powers: Like a knighthood, but with more root.\n",
-    "Expiring passwords: Because security theatre needs intermissions too.\n",
-    "Mapping UPNs: Translating bureaucrat-speak into bash-friendly names.\n",
-    "Brewing credentials: Stirring realms into a frothy /etc/passwd.\n",
-    "Auditing sudoers: Because even root needs a gatekeeper.\n",
-    "Realm wrangling: Herding users into PVE like digital cattle.\n",
-    "UPN transmogrification: Fancy word, simple trick - new username.\n",
-    "Provisioning accounts: Like cloud, but with more sweat.\n",
-    "Taming the realm: Because identity management loves drama.\n",
-    "Dropping sudo crumbs: Hansel and Gretel, but for sysadmins.\n",
-    "Binding groups: Social networking for your local /etc/group.\n",
-    "Scribing users: Writing your destiny straight into /etc/passwd.\n",
-    "Password roulette: Everyone's a winner.. until they log in.\n"
-]
-
-
 #===================#
 # Utility / Logging #
 #===================#
@@ -279,13 +222,6 @@ def fncPrintMessage(message, msg_type="info"):
         "disabled":Fore.LIGHTBLACK_EX + "{X} ",
     }
     print(f"{styles.get(msg_type, Fore.WHITE)}{message}{Style.RESET_ALL}")
-
-def fncPrintBanner():
-    print(Fore.CYAN + BANNER + Style.RESET_ALL)
-    print(random.choice(BLURBS))
-
-def fncPrintVersion():
-    print(Fore.CYAN + VERSION_INFO + Style.RESET_ALL)
 
 def fncCheckPyVersion():
     """Refuse to run on potato Python."""
@@ -925,13 +861,5 @@ def fncMain():
         sys.exit(1)
 
 if __name__ == "__main__":
-    # Banner + vibe check
-    print(Fore.CYAN + BANNER + Style.RESET_ALL)
-    print(random.choice(BLURBS))
-
-    if len(sys.argv) > 1 and sys.argv[1] in ['--version', '-v', '-V']:
-        fncPrintVersion()
-        sys.exit(0)
-
     fncCheckPyVersion()
     fncMain()
