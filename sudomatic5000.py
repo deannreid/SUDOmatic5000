@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from colorama import Fore, Style
 from urllib import request as _urlreq, parse as _urlparse
 from urllib.error import URLError, HTTPError
+import tempfile
 
 MIN_PYTHON_VERSION = (3, 11)
 ADMIN_REQUIRED = True   # yes, this needs root
@@ -251,15 +252,10 @@ def fncScriptSecurityCheck():
     return True
 
 def fncEnsurePaths():
-    """Make sure log/state folders exist (and sane perms)."""
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     os.makedirs(STATE_DIR, exist_ok=True)
-    # Also ensure /var/log/sudomatic5000 perms (root:root 0750)
-    try:
-        logdir = os.path.dirname(LOG_FILE)
-        os.chmod(logdir, 0o750)
-    except Exception:
-        pass
+    os.chmod(os.path.dirname(LOG_FILE), 0o750)
+    os.chmod(STATE_DIR, 0o750)
 
 def fncEnsureLogrotate():
     """Drop a logrotate file so the log doesn't grow to wales."""
@@ -325,6 +321,7 @@ def fncAcquireLock():
     os.makedirs(STATE_DIR, exist_ok=True)
     global _LOCK_FH
     _LOCK_FH = open(LOCK_PATH, "w")
+    os.chmod(LOCK_PATH, 0o600)
     fcntl.lockf(_LOCK_FH, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 def _graph_print_error(code: str, message: str,
@@ -345,6 +342,45 @@ def _graph_print_error(code: str, message: str,
         }
     }
     print(json.dumps(err, separators=(',', ':')))
+
+def _assert_regular_or_missing(p: str | os.PathLike):
+    try:
+        st = os.lstat(p)
+        if not stat.S_ISREG(st.st_mode):
+            raise RuntimeError(f"{p} is not a regular file")
+    except FileNotFoundError:
+        return
+
+def _safe_write_atomic(path: str, data: str, mode: int = 0o600):
+    d = os.path.dirname(path)
+    _assert_regular_or_missing(path)
+    # write to a secure temp in same dir
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=d)
+    try:
+        os.write(fd, data.encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.chmod(tmp, mode)
+    # refuse to overwrite a symlink
+    try:
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode):
+            os.remove(tmp)
+            raise RuntimeError(f"Refusing to overwrite symlink: {path}")
+    except FileNotFoundError:
+        pass
+    os.replace(tmp, path)
+
+
+def _allowed_domain(dom: str) -> bool:
+    dom = (dom or "").lower()
+    # Normalize: ignore blanks like "" in the set
+    filt = {d.strip().lower() for d in ALLOWED_UPN_DOMAINS if d and d.strip()}
+    if not filt:
+        return True  # empty filter = allow all
+    return dom in filt
+
 
 #====================#
 # Proxmox OIDC sync  #
@@ -397,10 +433,10 @@ def fncGetPveUsersForRealm(realm: str) -> set[str]:
             continue
         enabled = u.get("enable", 1)
         enabled_bool = (enabled is True) or (enabled == 1) or (str(enabled) == "1")
-        dom_ok = False
+        dom_ok = True
         if "@" in upn:
-            dom = upn.split("@", 1)[1].lower()
-            dom_ok = dom in ALLOWED_UPN_DOMAINS
+            dom_ok = _allowed_domain(upn.split("@",1)[1])
+
         if user_realm == realm and enabled_bool and upn and dom_ok:
             unix = fncUpnToUnix(upn)
             if unix:
@@ -492,65 +528,45 @@ def fncDeleteUser(user: str):
     else:
         logging.info("Deleted user (and home): %s", user)
 
+import tempfile
+
 def fncGrantSudo(user: str) -> bool:
-    """
-    Ensure /etc/sudoers.d/<file> has exactly what I want.
-    Writes only if content differs; validates with visudo first.
-    """
-    checker = globals().get("fncScriptSecurityCheck")
-    if not callable(checker):
-        logging.error("Security check function missing; refusing to grant sudo to %s", user)
-        return False
-    try:
-        if checker() is not True:
-            logging.error("Security check failed; refusing to grant sudo to %s", user)
-            return False
-    except Exception as e:
-        logging.error("Security check raised %s; refusing to grant sudo to %s", repr(e), user)
-        return False
-
-    if not GRANT_SUDO:
-        return False
-
-    os.makedirs("/etc/sudoers.d", exist_ok=True)
+    ...
     path = f"{MANAGED_SUDOERS_PREFIX}{user}"
-    expected = f"{user} ALL=(ALL) ALL\n" if not SUDO_NOPASSWD else f"{user} ALL=(ALL) NOPASSWD:ALL\n"
+    expected = f"{user} ALL=(ALL) {'NOPASSWD:ALL' if SUDO_NOPASSWD else 'ALL'}\n"
 
     current = ""
     if os.path.exists(path):
         try:
+            _assert_regular_or_missing(path)
             with open(path, "r") as f:
                 current = f.read()
         except Exception as e:
             logging.error("Failed to read sudoers for %s: %s", user, e)
 
     if current == expected:
-        logging.debug("Sudoers already correct for %s; no change", user)
         return False
 
-    tmp = f"{path}.tmp"
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(prefix=".sudomatic-", dir=d)
     try:
-        with open(tmp, "w") as f:
-            f.write(expected)
-        os.chmod(tmp, 0o440)
+        os.write(fd, expected.encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.chmod(tmp, 0o440)
 
-        rc, _, err = fncRun("visudo", ["-cf", tmp])
-        if rc != 0:
-            logging.error("visudo validation failed for %s: %s", user, err)
-            os.remove(tmp)
-            return False
-
-        os.replace(tmp, path)
-        logging.info("Updated sudoers for %s at %s", user, path)
-        return True
-    except Exception as e:
-        logging.error("Failed writing sudoers for %s: %s", user, e)
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
+    rc, _, err = fncRun("visudo", ["-cf", tmp])
+    if rc != 0:
+        logging.error("visudo validation failed for %s: %s", user, err)
+        os.remove(tmp)
         return False
+
+    _assert_regular_or_missing(path)
+    os.replace(tmp, path)
+    logging.info("Updated sudoers for %s at %s", user, path)
+    return True
+
 
 def fncRemoveSudoers(user: str):
     path = f"{MANAGED_SUDOERS_PREFIX}{user}"
@@ -587,6 +603,9 @@ def fncLoadState() -> dict:
         return {"known_users": [], "disabled": {}}
 
 def fncSaveState(state: dict):
+    data = json.dumps(state, indent=2)
+    _safe_write_atomic(STATE_PATH, data, 0o600)
+
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
@@ -1047,6 +1066,7 @@ def fncSync():
 
 def fncMain():
     try:
+        os.umask(0o077)
         fncScriptSecurityCheck()
         fncAdminCheck()
         fncSetupLogging()

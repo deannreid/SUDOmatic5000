@@ -225,7 +225,7 @@ def fncEnvBackupPath(p: Path) -> Path:
 def fncEncryptIfNeededInEnv(env_path: Path = ENVFILE):
     """
     If ENTR_CLNT_SEC (plaintext) exists, encrypt it to ENTR_CLNT_SEC_ENC using SUDOMATIC_ENC_KEY
-    and blank ENTR_CLNT_SEC. Also removes deprecated ENTR_SUPERUSR_ID lines.
+    and blank ENTR_CLNT_SEC.
     Preserves comments/formatting as much as possible.
     """
     if not env_path.exists():
@@ -688,19 +688,93 @@ def fncWriteEnvfile(content: str):
           + " (mode 0600)")
 
 def fncWriteChecker(expected_sha: str):
-    checker_script = f"""#!/bin/bash
-SCRIPT="{SCRIPT_DST}"
-EXPECTED_SHA="{expected_sha}"
-ACTUAL_SHA=$(/usr/bin/sha256sum "$SCRIPT" | awk '{{print $1}}')
+    # capture current env/key hashes at generation time (used as baselines)
+    try:
+        expected_env_sha = fncSha256Sum(ENVFILE) if ENVFILE.exists() else ""
+    except Exception:
+        expected_env_sha = ""
+    try:
+        expected_key_sha = fncSha256Sum(KEYFILE) if KEYFILE.exists() else ""
+    except Exception:
+        expected_key_sha = ""
 
-if [ "$ACTUAL_SHA" = "$EXPECTED_SHA" ]; then
-    exit 0
-else
-    MSG="Checksum mismatch! Potential tampering detected in $SCRIPT"
-    echo "$MSG" >&2
-    logger -t sudomatic_runner "$MSG"
+    checker_script = f"""#!/bin/bash
+set -euo pipefail
+
+SCRIPT="{SCRIPT_DST}"
+ENVFILE="{ENVFILE}"
+KEYFILE="{KEYFILE}"
+
+EXPECTED_SHA="{expected_sha}"
+EXPECTED_ENV_SHA="{expected_env_sha}"
+EXPECTED_KEY_SHA="{expected_key_sha}"
+
+log_warn() {{
+    logger -t sudomatic_runner "$1" || true
+    echo "$1" >&2
+}}
+
+fail() {{
+    logger -t sudomatic_runner "$1" || true
+    echo "$1" >&2
     exit 1
+}}
+
+check_secure_file() {{
+    # $1=path
+    local p="$1"
+    if [[ ! -e "$p" ]]; then
+        log_warn "Integrity: missing file: $p"
+        return 0
+    fi
+    # refuse symlinks
+    if [[ -L "$p" ]]; then
+        fail "Integrity: refusing to use symlink: $p"
+    fi
+    # root-owned?
+    local uid
+    uid=$(stat -Lc %u "$p" 2>/dev/null || echo 99999)
+    if [[ "$uid" != "0" ]]; then
+        fail "Integrity: $p not owned by root (uid=$uid)"
+    fi
+    # perms <= 0600
+    local mode
+    mode=$(stat -Lc %a "$p" 2>/dev/null || echo 777)
+    mode=${{mode: -3}}  # last three digits
+    if (( 10#"$mode" > 600 )); then
+        fail "Integrity: $p permissions too broad (have $mode, want <= 600)"
+    fi
+}}
+
+sha256_file() {{
+    /usr/bin/sha256sum "$1" | awk '{{print $1}}'
+}}
+
+# --- 1) Check main script checksum (hard fail on mismatch) ---
+ACTUAL_SHA=$(sha256_file "$SCRIPT")
+if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+    fail "Checksum mismatch! Potential tampering detected in $SCRIPT (have=$ACTUAL_SHA expect=$EXPECTED_SHA)"
 fi
+
+# --- 2) Verify ENVFILE hardening; warn if checksum changed ---
+check_secure_file "$ENVFILE"
+if [[ -e "$ENVFILE" && -n "$EXPECTED_ENV_SHA" ]]; then
+    ACTUAL_ENV_SHA=$(sha256_file "$ENVFILE")
+    if [[ "$ACTUAL_ENV_SHA" != "$EXPECTED_ENV_SHA" ]]; then
+        log_warn "Integrity: env checksum changed: $ENVFILE (have=$ACTUAL_ENV_SHA expect=$EXPECTED_ENV_SHA)"
+    fi
+fi
+
+# --- 3) Verify KEYFILE hardening; warn if checksum changed ---
+check_secure_file "$KEYFILE"
+if [[ -e "$KEYFILE" && -n "$EXPECTED_KEY_SHA" ]]; then
+    ACTUAL_KEY_SHA=$(sha256_file "$KEYFILE")
+    if [[ "$ACTUAL_KEY_SHA" != "$EXPECTED_KEY_SHA" ]]; then
+        log_warn "Integrity: key checksum changed: $KEYFILE (have=$ACTUAL_KEY_SHA expect=$EXPECTED_KEY_SHA)"
+    fi
+fi
+
+exit 0
 """
     CHECKER.write_text(checker_script)
     os.chmod(CHECKER, 0o700)
