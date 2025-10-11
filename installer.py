@@ -9,6 +9,8 @@ import argparse
 from pathlib import Path
 import json
 from colorama import init as _cinit, Fore as F, Style as S
+import re
+from datetime import datetime
 
 # ============================
 # Paths & constants
@@ -25,6 +27,9 @@ SERVICE = Path("/etc/systemd/system/sudomatic.service")
 TIMER = Path("/etc/systemd/system/sudomatic.timer")
 LOGDIR = Path("/var/log/sudomatic5000")
 ENVFILE = Path("/etc/sudomatic5000.env")
+KEYFILE = Path("/etc/sudomatic5000.key")      # separate env file, 0600
+ENC_KEY_ENV = "SUDOMATIC_ENC_KEY"             # the env var name holding the Fernet key
+ENV_ASSIGN_RE = re.compile(r"""^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:'([^']*)'|"([^"]*)"|([^\s#]+))\s*(?:#.*)?$""")
 
 BANNER = r"""
    _____ _    _ _____   ____  __  __       _______ _____ _____   _____  ___   ___   ___  
@@ -87,7 +92,7 @@ BLURBS = [
 # ============================
 _cinit(autoreset=True)
 
-_COLOR_MONO = False  # runtime override (set from argparse if you add a flag later)
+_COLOR_MONO = False
 
 def fncSetColorMode(monochrome: bool):
     """Call once after parsing args to disable colours when needed."""
@@ -168,6 +173,128 @@ def fncShQuote(val: str) -> str:
     if val is None:
         val = ""
     return "'" + val.replace("'", "'\"'\"'") + "'"
+
+def fncEnsureKeyfile():
+    """Ensure /etc/sudomatic5000.key exists with a Fernet key (mode 0600)."""
+    from base64 import urlsafe_b64encode
+    try:
+        if KEYFILE.exists():
+            os.chmod(KEYFILE, 0o600)
+            return
+        raw = os.urandom(32)                       # 32 bytes -> 44-char base64 urlsafe Fernet key
+        key_b64 = urlsafe_b64encode(raw).decode()
+        KEYFILE.write_text(f"{ENC_KEY_ENV}={key_b64}\n")
+        os.chmod(KEYFILE, 0o600)
+        fncOk(f"Created encryption key file {KEYFILE} (mode 0600)")
+    except Exception as e:
+        fncErr(f"Could not create {KEYFILE}: {e}")
+        sys.exit(1)
+
+def _fncParseKeyfile(path: Path) -> str | None:
+    try:
+        if not path.exists():
+            return None
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"): 
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                if k.strip() == ENC_KEY_ENV:
+                    return v.strip()
+    except Exception:
+        return None
+    return None
+
+def fncLoadEncKey() -> str | None:
+    """Prefer env (runtime), else the keyfile (installer/update)."""
+    val = os.environ.get(ENC_KEY_ENV, "").strip()
+    if val:
+        return val
+    return _fncParseKeyfile(KEYFILE)
+
+def fncEncryptSecretFernet(secret: str, key_b64: str) -> str:
+    from cryptography.fernet import Fernet
+    token = Fernet(key_b64.encode()).encrypt(secret.encode()).decode()
+    return f"fernet:{token}"
+
+def fncEnvBackupPath(p: Path) -> Path:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return p.with_suffix(p.suffix + f".bak-{ts}")
+
+def fncEncryptIfNeededInEnv(env_path: Path = ENVFILE):
+    """
+    If ENTR_CLNT_SEC (plaintext) exists, encrypt it to ENTR_CLNT_SEC_ENC using SUDOMATIC_ENC_KEY
+    and blank ENTR_CLNT_SEC. Also removes deprecated ENTR_SUPERUSR_ID lines.
+    Preserves comments/formatting as much as possible.
+    """
+    if not env_path.exists():
+        fncInfo(f"No env at {env_path}; nothing to migrate.")
+        return
+
+    enc_key = fncLoadEncKey()
+    if not enc_key:
+        fncErr(f"Missing encryption key for migration. Expected {KEYFILE} with {ENC_KEY_ENV}. Aborting migration.")
+        return
+
+    lines = env_path.read_text().splitlines(keepends=False)
+    changed = False
+
+    # Discover current values/positions
+    plain_val, plain_idx = None, None
+    enc_val, enc_idx = None, None
+
+    for idx, line in enumerate(lines):
+        m = ENV_ASSIGN_RE.match(line)
+        if not m:
+            continue
+        key = m.group(1)
+        val = m.group(2) or m.group(3) or m.group(4) or ""
+
+        if key == "ENTR_CLNT_SEC":
+            if val.strip():
+                plain_val, plain_idx = val, idx
+        elif key == "ENTR_CLNT_SEC_ENC":
+            if val.strip():
+                enc_val, enc_idx = val, idx
+
+    # If plaintext, ensure encrypted + blank plaintext
+    if plain_val is not None:
+        if enc_idx is None:
+            # create encrypted value
+            try:
+                enc_blob = fncEncryptSecretFernet(plain_val, enc_key)  # 'fernet:<token>'
+            except Exception as e:
+                fncErr(f"Failed to encrypt existing ENTR_CLNT_SEC: {e}")
+                return
+            # Append encrypted var near the bottom
+            lines.append("")
+            lines.append(f"ENTR_CLNT_SEC_ENC={fncShQuote(enc_blob)}")
+            changed = True
+        else:
+            # Already had encrypted value;
+            pass
+
+        # Blank the plaintext line if present
+        if plain_idx is not None and not lines[plain_idx].startswith("#"):
+            lines[plain_idx] = "ENTR_CLNT_SEC=''"
+            changed = True
+
+    if not changed:
+        fncInfo("Env examined; no changes required.")
+        return
+
+    # Backup and write
+    backup = fncEnvBackupPath(env_path)
+    try:
+        shutil.copy2(env_path, backup)
+        fncInfo(f"Backed up env to {fncColor(str(backup), 'white', 'bold')}")
+    except Exception as e:
+        fncWarn(f"Could not backup env file ({e}); proceeding carefully.")
+
+    env_path.write_text("\n".join(lines) + "\n")
+    os.chmod(env_path, 0o600)
+    fncOk("Env migration complete: plaintext secret removed, encrypted value stored, deprecated vars cleaned.")
 
 # ============================
 # Interactive prompts
@@ -451,7 +578,6 @@ def fncBuildEnvfileContent() -> str:
         lines += [
             "GRAPH_ENFORCE='false'",
             "GRAPH_FAIL_OPEN='true'",  # harmless here
-            "# ENTR_SUPERUSR_ID=''     # not used when GRAPH_ENFORCE=false",
             "# GRAPH_ACCESS_TOKEN=''   # not used when GRAPH_ENFORCE=false",
             "# ENTR_TENANT_ID=''       # not used when GRAPH_ENFORCE=false",
             "# ENTR_CLNT_ID=''         # not used when GRAPH_ENFORCE=false",
@@ -478,9 +604,6 @@ def fncBuildEnvfileContent() -> str:
         default="PVEUser" if "PVEUser" in roles else None
     )
     lines.append(f"ENTRA_ALLUSERS_PVE_ROLE={fncShQuote(all_role)}")
-
-    # Back-compat: also populate ENTR_SUPERUSR_ID with the same ID
-    lines.append(f"ENTR_SUPERUSR_ID={fncShQuote(all_gid)}  # DEPRECATED alias; using ENTRA_ALLUSERS_GROUP_ID")
 
     fail_open = ask_bool("Fail OPEN if Graph is unavailable?", default=True)
     lines.append(f"GRAPH_FAIL_OPEN={fncShQuote('true' if fail_open else 'false')}")
@@ -529,12 +652,27 @@ def fncBuildEnvfileContent() -> str:
         tenant = ask_nonempty("ENTR_TENANT_ID (Tenant ID GUID)")
         client = ask_nonempty("ENTR_CLNT_ID (App / Client ID GUID)")
         secret = getpass(fncColor("ENTR_CLNT_SEC (Client Secret) [input hidden]: ", "cyan", "bold")).strip()
+
+        # Load the key generated earlier by fncEnsureKeyfile()
+        enc_key = fncLoadEncKey()
+        if not enc_key:
+            fncErr(f"Missing encryption key. Expected {KEYFILE} with {ENC_KEY_ENV}. Aborting to avoid writing plaintext.")
+            sys.exit(1)
+
+        try:
+            enc = fncEncryptSecretFernet(secret, enc_key)   # -> 'fernet:<token>'
+        except Exception as e:
+            fncErr(f"Encryption failed ({e}). Aborting to avoid writing plaintext.")
+            sys.exit(1)
+
         lines += [
             f"ENTR_TENANT_ID={fncShQuote(tenant)}",
             f"ENTR_CLNT_ID={fncShQuote(client)}",
-            f"ENTR_CLNT_SEC={fncShQuote(secret)}",
+            "ENTR_CLNT_SEC=''",                       # never store plaintext
+            f"ENTR_CLNT_SEC_ENC={fncShQuote(enc)}",   # encrypted blob
             "AUTH_MODE='application'",
         ]
+        fncOk("Encrypted ENTR_CLNT_SEC and stored ENTR_CLNT_SEC_ENC in env.")
 
     return "\n".join(lines) + "\n"
 
@@ -578,6 +716,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 EnvironmentFile=-{ENVFILE}
+EnvironmentFile=-{KEYFILE}
 ExecCondition={CHECKER}
 ExecStart=/usr/bin/python3 {SCRIPT_DST}
 User=root
@@ -606,6 +745,7 @@ def fncDoInstall():
     fncHeading("[*] Installing Sudomatic 5000...")
 
     fncInstallRequirements()
+    fncEnsureKeyfile()  # <<< generate the key first
 
     # Install Python script
     shutil.copy2(SCRIPT_SRC, SCRIPT_DST)
@@ -621,7 +761,7 @@ def fncDoInstall():
     LOGDIR.mkdir(mode=0o750, parents=True, exist_ok=True)
     fncOk(f"Ensured log directory {LOGDIR}")
 
-    # Build env file (Graph vs PVE-only)
+    # Build env (this will encrypt using the key)
     env_content = fncBuildEnvfileContent()
     fncWriteEnvfile(env_content)
 
@@ -652,6 +792,9 @@ def fncDoUpdate(auto_restart: bool = False):
     if not CHECKER.exists():
         fncErr("Checker not found, did you run install first?")
         sys.exit(1)
+
+    # Ensure encryption key exists for potential migration
+    fncEnsureKeyfile()
 
     local_sha = fncSha256Sum(SCRIPT_SRC)
     installed_sha = fncSha256Sum(SCRIPT_DST)
@@ -684,6 +827,8 @@ def fncDoUpdate(auto_restart: bool = False):
             fncWriteEnvfile(content)
         else:
             fncInfo("Keeping existing env file.")
+            # Migrate plaintext -> encrypted in-place, remove deprecated vars
+            fncEncryptIfNeededInEnv(ENVFILE)
     else:
         if ask_yes_no("/etc/sudomatic5000.env not found. Create it now?", default_yes=True):
             content = fncBuildEnvfileContent()

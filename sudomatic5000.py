@@ -690,6 +690,35 @@ def fncPveEnsureAclRoles(userid: str, roles: set[str], path: str = "/") -> None:
 #====================#
 # Microsoft Graph    #
 #====================#
+def fncGetGraphClientSecret() -> str | None:
+    """
+    Returns the plaintext client secret from env, supporting encrypted storage.
+    - If ENTR_CLNT_SEC is set (plaintext), returns it.
+    - Else if ENTR_CLNT_SEC_ENC starts with 'fernet:', decrypt with SUDOMATIC_ENC_KEY.
+    """
+    from cryptography.fernet import Fernet
+
+    plain = os.getenv("ENTR_CLNT_SEC", "").strip()
+    if plain:  # optional legacy support;
+        return plain
+    
+    enc = os.getenv("ENTR_CLNT_SEC_ENC", "").strip()
+    if enc.startswith("fernet:"):
+        key_b64 = os.getenv("SUDOMATIC_ENC_KEY", "").strip()
+        if not key_b64:
+            logging.error("Missing SUDOMATIC_ENC_KEY for decrypting ENTR_CLNT_SEC_ENC")
+            return None
+        try:
+            from cryptography.fernet import Fernet
+            token = enc.split(":", 1)[1]
+            return Fernet(key_b64.encode()).decrypt(token.encode()).decode()
+        except Exception as e:
+            logging.error("Failed to decrypt ENTR_CLNT_SEC_ENC: %s", e)
+            return None
+    if enc:
+        logging.error("Unknown ENTR_CLNT_SEC_ENC format (expected 'fernet:...').")
+    return None
+
 def fncGraphGetToken() -> str | None:
     """Prefer a provided bearer token; otherwise use client credentials."""
     for name in TOKEN_ENV_FALLBACKS:
@@ -700,7 +729,8 @@ def fncGraphGetToken() -> str | None:
 
     tenant = os.getenv(ENV_MS_TENANT_ID, "").strip()
     client = os.getenv(ENV_MS_CLIENT_ID, "").strip()
-    secret = os.getenv(ENV_MS_CLIENT_SECRET, "").strip()
+    secret = fncGetGraphClientSecret() or ""
+
 
     def _seen(v): return "set" if v else "empty"
     logging.debug("Graph env check: TENANT=%s CLIENT=%s SECRET=%s", _seen(tenant), _seen(client), _seen(secret))
