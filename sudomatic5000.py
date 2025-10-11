@@ -63,6 +63,7 @@ USERNAME_MAXLEN = 32
 # Pin the binaries so shenanigans can't bite me
 BIN = {
   "pvesh":    "/usr/bin/pvesh",
+  "pveum":    "/usr/sbin/pveum",  
   "useradd":  "/usr/sbin/useradd",
   "usermod":  "/usr/sbin/usermod",
   "userdel":  "/usr/sbin/userdel",
@@ -208,7 +209,6 @@ if ENTRA_ALLUSERS_GROUP_ID and ENTRA_ALLUSERS_PVE_ROLE:
     PVE_ROLE_BY_GROUP[ENTRA_ALLUSERS_GROUP_ID] = ENTRA_ALLUSERS_PVE_ROLE
 if ENTRA_SUPERADMIN_GROUP_ID and ENTRA_SUPERADMIN_PVE_ROLE:
     PVE_ROLE_BY_GROUP[ENTRA_SUPERADMIN_GROUP_ID] = ENTRA_SUPERADMIN_PVE_ROLE
-
 
 # final list used by sync
 GRAPH_GROUP_IDS = sorted(_graph_ids)
@@ -598,6 +598,95 @@ def fncNowUTC() -> datetime:
 def fncParseISO(ts: str) -> datetime:
     return datetime.fromisoformat(ts)
 
+def fncPveUseridFromUpn(upn: str) -> str:
+    """PVE user id format: '<upn>@<REALM>' (REALM is the PVE OpenID realm name)."""
+    return f"{upn}@{REALM}"
+
+def fncPveUserExists(userid: str) -> bool:
+    """Check if a PVE user exists."""
+    # Fast path: pvesh get /access/users and search (avoids 404 noise)
+    rc, out, err = fncRun("pvesh", ["get", "/access/users", "--output-format", "json"])
+    if rc != 0:
+        logging.error("pvesh list users failed: %s", err)
+        return False
+    try:
+        data = json.loads(out)
+        return any(u.get("userid") == userid for u in data)
+    except Exception:
+        return False
+
+def fncPveEnsureUser(upn: str, enabled: bool = True) -> bool:
+    """
+    Ensure a Proxmox user exists for this UPN in the configured REALM.
+    Returns True if created/modified; False if already correct.
+    """
+    userid = fncPveUseridFromUpn(upn)
+    # Create if missing
+    if not fncPveUserExists(userid):
+        # pveum user add <user>@<realm> -enable 1
+        args = ["user", "add", userid]
+        if enabled:
+            args += ["-enable", "1"]
+        else:
+            args += ["-enable", "0"]
+        rc, _, err = fncRun("pveum", args)
+        if rc != 0:
+            logging.error("PVE user add failed for %s: %s", userid, err)
+            return False
+        logging.info("PVE user created: %s (enable=%s)", userid, int(enabled))
+        return True
+
+    # If exists, ensure enabled/disabled state
+    return fncPveUserSetEnabled(upn, enabled)
+
+def fncPveUserSetEnabled(upn: str, enabled: bool) -> bool:
+    """
+    Set PVE user enabled flag. Returns True if changed, False if already desired.
+    """
+    userid = fncPveUseridFromUpn(upn)
+    # Read current flag
+    rc, out, err = fncRun("pvesh", ["get", "/access/users", "--output-format", "json"])
+    if rc != 0:
+        logging.error("pvesh list users failed: %s", err)
+        return False
+    current = None
+    try:
+        for u in json.loads(out):
+            if u.get("userid") == userid:
+                # Proxmox returns 'enable' as 1/0/bool
+                v = u.get("enable")
+                current = (v is True) or (v == 1) or (str(v) == "1")
+                break
+    except Exception:
+        pass
+
+    if current is not None and current == enabled:
+        return False  # nothing to do
+
+    # pveum user modify <user> -enable {0|1}
+    rc, _, err = fncRun("pveum", ["user", "modify", userid, "-enable", "1" if enabled else "0"])
+    if rc != 0:
+        logging.error("PVE user set enabled failed for %s: %s", userid, err)
+        return False
+    logging.info("PVE user %s set enable=%s", userid, int(enabled))
+    return True
+
+def fncPveEnsureAclRoles(userid: str, roles: set[str], path: str = "/") -> None:
+    """
+    Ensure the user has the given roles at the path. Best-effort & additive (idempotent-ish).
+    Uses pveum acl modify which tolerates re-applying the same mapping.
+    """
+    if not roles:
+        return
+    for role in sorted(roles):
+        if not role:
+            continue
+        rc, _, err = fncRun("pveum", ["acl", "modify", path, "-user", userid, "-role", role])
+        if rc != 0:
+            logging.error("PVE ACL add failed: user=%s role=%s path=%s err=%s", userid, role, path, err)
+        else:
+            logging.info("PVE ACL ensured: %s @ %s role=%s", userid, path, role)
+
 #====================#
 # Microsoft Graph    #
 #====================#
@@ -800,6 +889,24 @@ def fncSync():
         if token:
             groups = fncGraphListManyGroups(GRAPH_GROUP_IDS, token, role_map=PVE_ROLE_BY_GROUP)
             fncPrintGroupReport(groups)
+            
+            # Map UPN -> set of PVE roles (based on membership of the groups we fetched)
+            user_roles_by_upn: dict[str, set[str]] = {}
+
+            for g in groups:
+                role = (g.get("pve_role") or "").strip()
+                if not role:
+                    continue  # groups without a role just control allowlist but assign no PVE role
+                for upn in g["upns"]:
+                    s = user_roles_by_upn.setdefault(upn, set())
+                    s.add(role)
+
+            # Prefer the first-seen UPN for a given unix (collision-safe enough for most orgs)
+            unix_to_upn: dict[str, str] = {}
+            for g in groups:
+                for upn in g["upns"]:
+                    ux = fncUpnToUnix(upn)
+                    unix_to_upn.setdefault(ux, upn)
 
             if not groups:
                 logging.warning("Graph returned no groups (errors). Proceeding without enforcement (fail-open).")
@@ -816,7 +923,6 @@ def fncSync():
             fncPrintMessage("Graph token unavailable: proceeding without enforcement (fail-open).", "warning")
     elif GRAPH_ENFORCE and not GRAPH_GROUP_IDS:
         logging.warning("GRAPH_ENFORCE=True but no group IDs resolved from ENTRA_GROUP_IDS/ENTRA_ROLE_MAP/ENTRA_*_GROUP_ID/ENTR_SUPERUSR_ID; skipping enforcement.")
-
 
     state = fncLoadState()
     known = set(state.get("known_users", []))
@@ -847,6 +953,22 @@ def fncSync():
 
         known.add(user)
 
+        upn = None
+        if GRAPH_ENFORCE:
+            upn = unix_to_upn.get(user)  # only available when Graph is ON
+        if upn:
+            try:
+                # Ensure user exists & enabled in PVE
+                fncPveEnsureUser(upn, enabled=True)
+
+                # Attach any roles from group membership
+                roles_for_user = user_roles_by_upn.get(upn, set())
+                if roles_for_user:
+                    fncPveEnsureAclRoles(fncPveUseridFromUpn(upn), roles_for_user, path="/")
+
+            except Exception as e:
+                logging.error("PVE SSO provisioning failed for %s: %s", upn, e)
+
     for user in sorted(known - desired):
         if not fncUserExists(user):
             logging.info("User %s already gone; cleaning state", user)
@@ -864,6 +986,9 @@ def fncSync():
             fncLockUser(user)
             disabled[user] = fncNowUTC().isoformat()
             logging.info("User %s removed from realm; locked and marked for deletion in %s", user, str(DELETE_AFTER))
+            upn = unix_to_upn.get(user) if GRAPH_ENFORCE else None
+            if upn:
+                fncPveUserSetEnabled(upn, enabled=False)
         else:
             try:
                 locked_at = fncParseISO(disabled[user])
