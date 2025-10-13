@@ -1,0 +1,175 @@
+<!-- ================================================================
+  File    : sudomatic_decoder.xml
+  Purpose : Program-specific decoders for Sudomatic checker + app
+  Notes   : All checker decoders are anchored to program_name '^sudomatic_runner$'
+           to avoid being matched by generic decoders (e.g. sudo).
+           Uses OSRegex / POSIX ERE only.
+================================================================ -->
+
+<!-- ============================
+     SUDOMATIC CHECKER DECODERS
+     (program-specific to avoid collisions)
+     ============================ -->
+
+<decoder name="sudomatic-runner">
+  <program_name>^sudomatic_runner$</program_name>
+  <regex>^(.+)$</regex>
+  <order>msg</order>
+</decoder>
+
+<decoder name="sudomatic-runner-checksum-fail">
+  <!-- exact program match here to guarantee specificity -->
+  <program_name>^sudomatic_runner$</program_name>
+  <regex>^Checksum mismatch! Potential tampering detected in ([^[:space:]]+) \(have=([0-9a-f]{64}) expect=([0-9a-f]{64})\)$</regex>
+  <order>path, have_hash, expect_hash</order>
+</decoder>
+
+<decoder name="sudomatic-runner-symlink">
+  <program_name>^sudomatic_runner$</program_name>
+  <regex>^Integrity: refusing to use symlink: (.+)$</regex>
+  <order>path</order>
+</decoder>
+
+<decoder name="sudomatic-runner-ownership">
+  <program_name>^sudomatic_runner$</program_name>
+  <regex>^Integrity: (.+) not owned by root \(uid=([0-9]+)\)$</regex>
+  <order>path, uid</order>
+</decoder>
+
+<decoder name="sudomatic-runner-perms">
+  <program_name>^sudomatic_runner$</program_name>
+  <regex>^Integrity: (.+) permissions too broad \(have ([0-7]{3}), want &lt;= 600\)$</regex>
+  <order>path, mode</order>
+</decoder>
+
+<decoder name="sudomatic-runner-missing">
+  <program_name>^sudomatic_runner$</program_name>
+  <regex>^Integrity: missing file: (.+)$</regex>
+  <order>path</order>
+</decoder>
+
+<decoder name="sudomatic-runner-env-warn">
+  <program_name>^sudomatic_runner$</program_name>
+  <regex>^Integrity: env checksum changed: (.+) \(have=([0-9a-f]{64}) expect=([0-9a-f]{64})\)$</regex>
+  <order>path, have_hash, expect_hash</order>
+</decoder>
+
+<decoder name="sudomatic-runner-key-warn">
+  <program_name>^sudomatic_runner$</program_name>
+  <regex>^Integrity: key checksum changed: (.+) \(have=([0-9a-f]{64}) expect=([0-9a-f]{64})\)$</regex>
+  <order>path, have_hash, expect_hash</order>
+</decoder>
+
+<!-- ============================
+     SUDOMATIC APP DECODERS
+     (log file /var/log/sudomatic5000/thelog.log)
+     ============================ -->
+
+<decoder name="sudomatic-app">
+  <prematch>^[0-9][0-9][0-9][0-9]-</prematch>
+  <regex>^(.+)$</regex>
+  <order>msg</order>
+</decoder>
+
+<!-- User lifecycle -->
+<decoder name="sudomatic-app-user-created">
+  <parent>sudomatic-app</parent>
+  <regex>^Created local user: ([A-Za-z0-9_.-]+)$</regex>
+  <order>dstuser</order>
+</decoder>
+
+<decoder name="sudomatic-app-user-deleted">
+  <parent>sudomatic-app</parent>
+  <regex>^Deleted user \(and home\): ([A-Za-z0-9_.-]+)$</regex>
+  <order>dstuser</order>
+</decoder>
+
+<!-- Separate locked/unlocked decoders (no alternation) -->
+<decoder name="sudomatic-app-locked">
+  <parent>sudomatic-app</parent>
+  <regex>^Locked user: ([A-Za-z0-9_.-]+)$</regex>
+  <order>dstuser</order>
+</decoder>
+
+<decoder name="sudomatic-app-unlocked">
+  <parent>sudomatic-app</parent>
+  <regex>^Unlocked user: ([A-Za-z0-9_.-]+)$</regex>
+  <order>dstuser</order>
+</decoder>
+
+<decoder name="sudomatic-app-initpass">
+  <parent>sudomatic-app</parent>
+  <regex>^Initial password set and expired for ([A-Za-z0-9_.-]+) \(not stored\)$</regex>
+  <order>dstuser</order>
+</decoder>
+
+<!-- Group membership -->
+<decoder name="sudomatic-app-group-add">
+  <parent>sudomatic-app</parent>
+  <regex>^Added ([A-Za-z0-9_.-]+) to group ([A-Za-z0-9_.-]+)$</regex>
+  <order>dstuser, group</order>
+</decoder>
+
+<decoder name="sudomatic-app-group-remove">
+  <parent>sudomatic-app</parent>
+  <regex>^Removed ([A-Za-z0-9_.-]+) from group ([A-Za-z0-9_.-]+)$</regex>
+  <order>dstuser, group</order>
+</decoder>
+
+<!-- Sudoers -->
+<decoder name="sudomatic-app-sudoers-update">
+  <parent>sudomatic-app</parent>
+  <regex>^Updated sudoers for ([A-Za-z0-9_.-]+) at (.+)$</regex>
+  <order>dstuser, path</order>
+</decoder>
+
+<decoder name="sudomatic-app-sudoers-remove">
+  <parent>sudomatic-app</parent>
+  <regex>^Removed sudoers file for ([A-Za-z0-9_.-]+)$</regex>
+  <order>dstuser</order>
+</decoder>
+
+<!-- Deprovision -->
+<decoder name="sudomatic-app-mark-delete">
+  <parent>sudomatic-app</parent>
+  <regex>^User ([A-Za-z0-9_.-]+) not in Entra allow-groups; locked and marked for deletion in (.+)$</regex>
+  <order>dstuser, ttl</order>
+</decoder>
+
+<decoder name="sudomatic-app-deleted-after-grace">
+  <parent>sudomatic-app</parent>
+  <regex>^User ([A-Za-z0-9_.-]+) disabled for >= .+; deleting$</regex>
+  <order>dstuser</order>
+</decoder>
+
+<!-- PVE -->
+<decoder name="sudomatic-app-pve-user-create">
+  <parent>sudomatic-app</parent>
+  <regex>^PVE user created: (.+) \(enable=[0-9]\)$</regex>
+  <order>pve_userid</order>
+</decoder>
+
+<decoder name="sudomatic-app-pve-enable">
+  <parent>sudomatic-app</parent>
+  <regex>^PVE user (.+) set enable=[0-9]$</regex>
+  <order>pve_userid</order>
+</decoder>
+
+<decoder name="sudomatic-app-pve-acl">
+  <parent>sudomatic-app</parent>
+  <regex>^PVE ACL ensured: (.+) @ (.+) role=(.+)$</regex>
+  <order>pve_userid, pve_path, pve_role</order>
+</decoder>
+
+<!-- Operational -->
+<decoder name="sudomatic-app-missing-bin">
+  <parent>sudomatic-app</parent>
+  <regex>^Missing required binary: ([A-Za-z0-9_.-]+) -> (.+)$</regex>
+  <order>bin_key, bin_path</order>
+</decoder>
+
+<decoder name="sudomatic-app-visudo-fail">
+  <parent>sudomatic-app</parent>
+  <regex>^visudo validation failed for ([A-Za-z0-9_.-]+): (.+)$</regex>
+  <order>dstuser, err</order>
+</decoder>
