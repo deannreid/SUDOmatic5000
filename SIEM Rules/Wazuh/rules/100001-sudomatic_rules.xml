@@ -1,0 +1,179 @@
+<!-- ================================================================
+  File    : sudomatic_rules.xml
+  Purpose : Sudomatic checker + app rules (compat: no correlations,
+            app rules key off base decoder with message regex)
+================================================================ -->
+
+<!-- ================= CHECKER (sudomatic_runner) ================= -->
+<group name="local,sudomatic,integrity,">
+
+  <!-- Critical: checksum mismatch -->
+  <rule id="1600" level="12">
+    <decoded_as>sudomatic-runner-checksum-fail</decoded_as>
+    <description>Sudomatic: Checksum mismatch â€“ potential tampering in $(path)</description>
+    <mitre><id>T1553</id><id>T1565</id></mitre>
+    <group>sudomatic,integrity,tamper,</group>
+  </rule>
+
+  <!-- Hard-fail conditions -->
+  <rule id="1610" level="11">
+    <decoded_as>sudomatic-runner-symlink</decoded_as>
+    <description>Sudomatic: Refusing to use symlink $(path)</description>
+    <group>sudomatic,integrity,hardening,</group>
+  </rule>
+
+  <rule id="1611" level="10">
+    <decoded_as>sudomatic-runner-ownership</decoded_as>
+    <description>Sudomatic: $(path) not owned by root (uid=$(uid))</description>
+    <group>sudomatic,integrity,hardening,</group>
+  </rule>
+
+  <rule id="1612" level="10">
+    <decoded_as>sudomatic-runner-perms</decoded_as>
+    <description>Sudomatic: $(path) permissions too broad (have $(mode), want â‰¤ 600)</description>
+    <group>sudomatic,integrity,hardening,</group>
+  </rule>
+
+  <!-- Warnings / drift -->
+  <rule id="1620" level="5">
+    <decoded_as>sudomatic-runner-missing</decoded_as>
+    <description>Sudomatic: Missing file $(path)</description>
+    <group>sudomatic,integrity,warning,</group>
+  </rule>
+
+  <rule id="1621" level="6">
+    <decoded_as>sudomatic-runner-env-warn</decoded_as>
+    <description>Sudomatic: ENV checksum changed for $(path)</description>
+    <group>sudomatic,integrity,warning,</group>
+  </rule>
+
+  <rule id="1622" level="6">
+    <decoded_as>sudomatic-runner-key-warn</decoded_as>
+    <description>Sudomatic: KEY checksum changed for $(path)</description>
+    <group>sudomatic,integrity,warning,</group>
+  </rule>
+
+</group>
+
+<!-- ================= APP (thelog.log) ================= -->
+<group name="local,sudomatic,account_management,">
+
+  <!-- User lifecycle -->
+  <rule id="1700" level="7">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^Created local user: [A-Za-z0-9_.-]+$</regex>
+    <description>Sudomatic: Local user created</description>
+    <group>user,provisioning,sudomatic,</group>
+  </rule>
+
+  <rule id="1701" level="10">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^Deleted user \(and home\): [A-Za-z0-9_.-]+$</regex>
+    <description>Sudomatic: Local user deleted (and home)</description>
+    <group>user,deprovisioning,sudomatic,</group>
+  </rule>
+
+  <!-- Account lock/unlock -->
+  <rule id="1710" level="6">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^Locked user: [A-Za-z0-9_.-]+$</regex>
+    <description>Sudomatic: Account locked</description>
+    <group>user,lock,sudomatic,</group>
+  </rule>
+
+  <rule id="1711" level="6">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^Unlocked user: [A-Za-z0-9_.-]+$</regex>
+    <description>Sudomatic: Account unlocked</description>
+    <group>user,unlock,sudomatic,</group>
+  </rule>
+
+  <rule id="1712" level="6">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^Initial password set and expired for [A-Za-z0-9_.-]+ \(not stored\)$</regex>
+    <description>Sudomatic: Initial password set &amp; expired</description>
+    <group>user,password,sudomatic,</group>
+  </rule>
+
+  <!-- Privilege changes (sudo-specific) -->
+  <rule id="1720" level="9">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^Added [A-Za-z0-9_.-]+ to group sudo$</regex>
+    <description>Sudomatic: Privilege grant â€” user added to sudo</description>
+    <group>privilege_escalation,sudo,sudomatic,</group>
+  </rule>
+
+  <rule id="1721" level="8">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^Removed [A-Za-z0-9_.-]+ from group sudo$</regex>
+    <description>Sudomatic: Privilege revoked â€” user removed from sudo</description>
+    <group>privilege_revocation,sudo,sudomatic,</group>
+  </rule>
+
+  <!-- Sudoers managed file changes -->
+  <rule id="1730" level="9">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^Updated sudoers for [A-Za-z0-9_.-]+ at .+$</regex>
+    <description>Sudomatic: Sudoers file updated</description>
+    <group>sudoers_change,sudomatic,</group>
+  </rule>
+
+  <rule id="1731" level="8">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^Removed sudoers file for [A-Za-z0-9_.-]+$</regex>
+    <description>Sudomatic: Sudoers file removed</description>
+    <group>sudoers_change,sudomatic,</group>
+  </rule>
+
+  <!-- Deprovision lifecycle -->
+  <rule id="1740" level="6">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^User [A-Za-z0-9_.-]+ not in Entra allow-groups; locked and marked for deletion in .+$</regex>
+    <description>Sudomatic: User marked for deletion after grace</description>
+    <group>deprovisioning,sudomatic,</group>
+  </rule>
+
+  <rule id="1741" level="10">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^User [A-Za-z0-9_.-]+ disabled for >= .+; deleting$</regex>
+    <description>Sudomatic: User deleted after grace period</description>
+    <group>deprovisioning,sudomatic,</group>
+  </rule>
+
+  <!-- PVE visibility -->
+  <rule id="1750" level="4">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^PVE user created: .+ \(enable=[0-9]\)$</regex>
+    <description>Sudomatic: PVE user created</description>
+    <group>pve,provisioning,sudomatic,</group>
+  </rule>
+
+  <rule id="1751" level="4">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^PVE user .+ set enable=[0-9]$</regex>
+    <description>Sudomatic: PVE user enable toggled</description>
+    <group>pve,sudomatic,</group>
+  </rule>
+
+  <rule id="1752" level="5">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^PVE ACL ensured: .+ @ .+ role=.+$</regex>
+    <description>Sudomatic: PVE ACL ensured</description>
+    <group>pve,acl,sudomatic,</group>
+  </rule>
+
+  <!-- Operational issues -->
+  <rule id="1760" level="8">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^Missing required binary: [A-Za-z0-9_.-]+ -> .+$</regex>
+    <description>Sudomatic: Missing required binary</description>
+    <group>operational,sudomatic,</group>
+  </rule>
+
+  <rule id="1761" level="9">
+    <decoded_as>sudomatic-app</decoded_as>
+    <regex>^visudo validation failed for [A-Za-z0-9_.-]+: .+$</regex>
+    <description>Sudomatic: visudo validation failed</description>
+    <group>sudoers_change,error,sudomatic,</group>
+  </rule>
+</group>
