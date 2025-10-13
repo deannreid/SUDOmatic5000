@@ -1,0 +1,123 @@
+<rules>
+  <!-- Base classification for Sudomatic 5000 -->
+  <rule id="100500" level="3">
+    <decoded_as>sudomatic5000-json</decoded_as>
+    <description>Sudomatic 5000 event</description>
+    <group>sudomatic5000,linux,</group>
+  </rule>
+
+  <!-- 1) Executable integrity failed (blocked) -->
+  <rule id="100501" level="12">
+    <if_sid>100500</if_sid>
+    <field name="event_type">^integrity_block$</field>
+    <description>Sudomatic 5000: Executable integrity check failed (blocked)</description>
+    <group>sudomatic5000,integrity,execution_blocked,</group>
+    <mitre>
+      <id>T1553.001</id> <!-- Subvert Trust Controls: Code Signing -->
+      <tactic>defense-evasion</tactic>
+    </mitre>
+  </rule>
+
+  <!-- 2) Secrets integrity failed (env/key mismatch) -->
+  <rule id="100502" level="12">
+    <if_sid>100500</if_sid>
+    <field name="event_type">^secrets_integrity_block$</field>
+    <description>Sudomatic 5000: Secrets/config integrity failed (blocked)</description>
+    <group>sudomatic5000,integrity,secret_tamper,execution_blocked,</group>
+    <mitre>
+      <id>T1552</id> <!-- Unsecured Credentials -->
+      <tactic>credential-access</tactic>
+    </mitre>
+  </rule>
+
+  <!-- 3) Graph fail-open (no changes applied) -->
+  <rule id="100503" level="6">
+    <if_sid>100500</if_sid>
+    <field name="event_type">^graph_fail_open$</field>
+    <description>Sudomatic 5000: MS Graph unavailable — fail-open policy in effect</description>
+    <group>sudomatic5000,dependency,availability,</group>
+    <mitre>
+      <id>T1562</id> <!-- Impair Defenses -->
+      <tactic>defense-evasion</tactic>
+    </mitre>
+  </rule>
+
+  <!-- 4) Local user provisioned/updated -->
+  <rule id="100504" level="5">
+    <if_sid>100500</if_sid>
+    <field name="event_type">^user_provisioned$</field>
+    <description>Sudomatic 5000: Local user provisioned / PVE SSO mapped</description>
+    <group>sudomatic5000,account-management,persistence,</group>
+    <mitre>
+      <id>T1136</id> <!-- Create Account -->
+      <tactic>persistence</tactic>
+    </mitre>
+  </rule>
+
+  <!-- 5) Local user locked (removed from group) -->
+  <rule id="100505" level="6">
+    <if_sid>100500</if_sid>
+    <field name="event_type">^user_locked$</field>
+    <description>Sudomatic 5000: User locked (removed from realm or policy)</description>
+    <group>sudomatic5000,account-management,</group>
+    <mitre>
+      <id>T1098</id> <!-- Account Manipulation -->
+      <tactic>defense-evasion</tactic>
+    </mitre>
+  </rule>
+
+  <!-- 6) Local user deleted (grace exceeded) -->
+  <rule id="100506" level="8">
+    <if_sid>100500</if_sid>
+    <field name="event_type">^user_deleted$</field>
+    <description>Sudomatic 5000: User deleted after grace period</description>
+    <group>sudomatic5000,account-removal,impact,</group>
+    <mitre>
+      <id>T1531</id> <!-- Account Access Removal -->
+      <tactic>impact</tactic>
+    </mitre>
+  </rule>
+
+  <!-- 7) Sudoers changed (per-user file) -->
+  <rule id="100507" level="9">
+    <if_sid>100500</if_sid>
+    <field name="event_type">^sudoers_updated$</field>
+    <description>Sudomatic 5000: Per-user sudoers updated</description>
+    <group>sudomatic5000,privilege-escalation,authorization,</group>
+    <mitre>
+      <id>T1548.003</id> <!-- Abuse Elevation Control Mechanism: Sudo -->
+      <tactic>privilege-escalation</tactic>
+    </mitre>
+  </rule>
+
+  <!-- 8) PVE ACL/role assignment -->
+  <rule id="100508" level="6">
+    <if_sid>100500</if_sid>
+    <field name="event_type">^pve_role_assigned$</field>
+    <description>Sudomatic 5000: PVE ACL ensured for user</description>
+    <group>sudomatic5000,authorization,</group>
+    <mitre>
+      <id>T1098.003</id> <!-- Account Manipulation: Add to Group/Role -->
+      <tactic>defense-evasion</tactic>
+    </mitre>
+  </rule>
+
+  <!-- 9) Entra account disabled (kept disabled locally; no delete) -->
+  <rule id="100509" level="7">
+    <if_sid>100500</if_sid>
+    <field name="event_type">^entra_account_disabled_detected$</field>
+    <description>Sudomatic 5000: Entra account disabled — local account held disabled</description>
+    <group>sudomatic5000,account-status,</group>
+    <mitre>
+      <id>T1098</id>
+      <tactic>defense-evasion</tactic>
+    </mitre>
+  </rule>
+
+  <!-- Optional: high-level correlation if multiple integrity blocks seen -->
+  <rule id="100520" level="13" frequency="3" timeframe="600">
+    <if_matched_sid>100501,100502</if_matched_sid>
+    <description>Sudomatic 5000: Repeated integrity failures</description>
+    <group>sudomatic5000,integrity,correlation,</group>
+  </rule>
+</rules>
