@@ -321,7 +321,18 @@ for gid in (ENTRA_ALLUSERS_GROUP_ID, ENTRA_SUPERADMIN_GROUP_ID):
 GRAPH_GROUP_IDS = sorted(_graph_ids)
 
 # Map group → PVE role (only non-empty)
-PVE_ROLE_BY_GROUP = { (m.get("group") or "").strip(): (m.get("pve_role") or "") for m in (ENTRA_ROLE_MAP or []) if (m.get("group") or "").strip() }
+PVE_ROLE_BY_GROUP = {
+    (m.get("group") or "").strip(): (m.get("pve_role") or "")
+    for m in (ENTRA_ROLE_MAP or [])
+    if (m.get("group") or "").strip()
+}
+
+# Include overrides for AllUsers and SuperAdmin if provided
+if ENTRA_ALLUSERS_GROUP_ID and ENTRA_ALLUSERS_PVE_ROLE:
+    PVE_ROLE_BY_GROUP[ENTRA_ALLUSERS_GROUP_ID] = ENTRA_ALLUSERS_PVE_ROLE
+
+if ENTRA_SUPERADMIN_GROUP_ID and ENTRA_SUPERADMIN_PVE_ROLE:
+    PVE_ROLE_BY_GROUP[ENTRA_SUPERADMIN_GROUP_ID] = ENTRA_SUPERADMIN_PVE_ROLE
 
 #===================#
 # Utility / Logging #
@@ -791,7 +802,7 @@ def fncPveEnsureUser(upn: str, enabled: bool = True) -> bool:
     return fncPveUserSetEnabled(upn, enabled)
 
 # Function: fncPveUserSetEnabled
-# Purpose : Toggle a PVE user’s enabled flag if needed.
+# Purpose : Toggle a PVE users enabled flag if needed.
 # Notes   : No-op if already desired state.
 def fncPveUserSetEnabled(upn: str, enabled: bool) -> bool:
     userid = fncPveUseridFromUpn(upn)
