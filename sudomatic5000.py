@@ -327,10 +327,6 @@ PVE_ROLE_BY_GROUP = {
     if (m.get("group") or "").strip()
 }
 
-# Include overrides for AllUsers and SuperAdmin if provided
-if ENTRA_ALLUSERS_GROUP_ID and ENTRA_ALLUSERS_PVE_ROLE:
-    PVE_ROLE_BY_GROUP[ENTRA_ALLUSERS_GROUP_ID] = ENTRA_ALLUSERS_PVE_ROLE
-
 if ENTRA_SUPERADMIN_GROUP_ID and ENTRA_SUPERADMIN_PVE_ROLE:
     PVE_ROLE_BY_GROUP[ENTRA_SUPERADMIN_GROUP_ID] = ENTRA_SUPERADMIN_PVE_ROLE
 
@@ -458,8 +454,12 @@ def fncSanitiseUnix(name: str) -> str:
 # Purpose : Map a UPN (user@domain) to the Unix login format you want.
 # Notes   : Supports "useronly" or "upn_concat" modes via USERNAME_MODE/USERNAME_SEPARATOR.
 def fncUpnToUnix(upn: str) -> str:
-    base = upn.replace("@", USERNAME_SEPARATOR) if USERNAME_MODE == "upn_concat" else upn.split("@", 1)[0]
-    return fncSanitiseUnix(base)
+    # username part only (left of @) → lowercase, safe chars
+    left = upn.split("@", 1)[0]
+    left = left.lower()                     # <= keep unix lowercase always
+    left = left.replace(".", "_")
+    left = re.sub(r"[^a-z0-9._-]", "_", left)
+    return left[:USERNAME_MAXLEN]
 
 # Function: fncRun
 # Purpose : Execute a pinned binary by logical key; capture rc/stdout/stderr.
@@ -1023,16 +1023,18 @@ def fncGraphListGroupUPNs(group_id: str, token: str) -> list[tuple[str, bool]] |
             return None
 
         for item in doc.get("value", []):
-            raw_upn = (item.get("userPrincipalName") or "").strip()
-            if not raw_upn:
+            upn_orig = (item.get("userPrincipalName") or "").strip()
+            if not upn_orig:
                 continue
-            upn = raw_upn.lower()
+
+            # domain filter: case-insensitive
             if allowed_domains:
-                dom = upn.split("@", 1)[-1]
-                if dom not in allowed_domains:
+                dom_l = upn_orig.split("@", 1)[-1].lower()
+                if dom_l not in allowed_domains:
                     continue
+
             enabled = bool(item.get("accountEnabled", True))
-            rows.append((upn, enabled))
+            rows.append((upn_orig, enabled))
 
         url = doc.get("@odata.nextLink")
 
@@ -1252,11 +1254,22 @@ def fncSync():
 
         if not entra_enabled:
             # Entra account disabled but still in groups → disable locally (no delete countdown)
+            fncPveUserSetEnabled(upn, enabled=False)
             fncLockUser(user)
             if user not in disabled:
                 disabled[user] = _get_utc_datetime().isoformat()
+            upn = unix_to_upn.get(user)   # original case for PVE
+            is_superadmin = (upn and upn.lower() in in_superadmin_ci)
+            # ...
             if upn:
-                fncPveUserSetEnabled(upn, enabled=False)
+                fncPveEnsureUser(upn, enabled=True)               # uses original case
+                roles = set(user_roles_by_upn.get(upn, set()))
+                # add baseline role if desired
+                if (upn.lower() in in_allusers_ci) and ENTRA_ALLUSERS_PVE_ROLE and not roles:
+                    roles = {ENTRA_ALLUSERS_PVE_ROLE}
+                if roles:
+                    fncPveEnsureAclRoles(fncPveUseridFromUpn(upn), roles, path="/")  # upn in original case
+
             fncRemoveSudoers(user)
             fncRemoveUserFromGroup(user, "sudo")
             known.add(user)
