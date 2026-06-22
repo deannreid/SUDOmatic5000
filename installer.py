@@ -600,6 +600,15 @@ def fncBuildEnvfileContent() -> str:
             fncWarn("Please enter 1 or 2.")
         tier_scope = "linux" if scope_raw == "1" else "both"
 
+        print()
+        fncHeading("== Tiered Account: SSH Lockdown ==")
+        fncInfo("Optionally block DIRECT SSH login for tiered accounts. Operators then")
+        fncInfo(f"log in with their base account and escalate locally "
+                f"({fncColor('su - <tiered>', 'cyan')}, then {fncColor('sudo -i', 'cyan')}).")
+        fncInfo("A managed sshd_config.d drop-in is written and sshd is reloaded "
+                "(validated first).")
+        ssh_deny = ask_bool("Block direct SSH login for tiered accounts?", default=False)
+
         lines += [
             "",
             "# Tiered accounts",
@@ -607,8 +616,10 @@ def fncBuildEnvfileContent() -> str:
             f"TIERED_ACCOUNT_MODE={fncShQuote(tier_mode)}",
             f"TIERED_ACCOUNT_VALUE={fncShQuote(tier_value)}",
             f"TIERED_ACCOUNT_SCOPE={fncShQuote(tier_scope)}",
+            f"TIERED_SSH_DENY_DIRECT={fncShQuote('true' if ssh_deny else 'false')}",
         ]
-        fncOk(f"Tiered accounts enabled: {tier_mode} '{tier_value}', scope={tier_scope}")
+        fncOk(f"Tiered accounts enabled: {tier_mode} '{tier_value}', scope={tier_scope}, "
+              f"ssh_deny={'true' if ssh_deny else 'false'}")
     else:
         lines += [
             "",
@@ -617,6 +628,7 @@ def fncBuildEnvfileContent() -> str:
             "TIERED_ACCOUNT_MODE='prefix'",
             "TIERED_ACCOUNT_VALUE=''",
             "TIERED_ACCOUNT_SCOPE='linux'",
+            "TIERED_SSH_DENY_DIRECT='false'",
         ]
 
     # ── Proxmox Backup Server (PBS) ───────────────────────────────────────────

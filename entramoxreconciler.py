@@ -16,6 +16,7 @@
 
 # Standard library
 import fcntl
+import fnmatch
 import json
 import logging
 import os
@@ -57,6 +58,7 @@ STATE_DIR = "/var/lib/entramoxreconciler/pve_oidc_sync"
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 LOCK_PATH  = os.path.join(STATE_DIR, ".lock")
 MANAGED_SUDOERS_PREFIX = "/etc/sudoers.d/pve_realm-"
+TIERED_SSHD_DROPIN = "/etc/ssh/sshd_config.d/99-entramox-tiered.conf"
 
 DELETE_AFTER = timedelta(hours=24)  # Lock grace period before deletion
 PASSWORD_LENGTH = 38                # Random initial password length
@@ -96,6 +98,8 @@ BIN = {
   "getent":   "/usr/bin/getent",
   "groupadd": "/usr/sbin/groupadd",
   "gpasswd":  "/usr/bin/gpasswd",
+  "sshd":     "/usr/sbin/sshd",
+  "systemctl":"/usr/bin/systemctl",
 }
 
 #-----------------------------------------#
@@ -108,6 +112,9 @@ TIERED_ACCOUNTS      = False       # Create a privileged twin account for supera
 TIERED_ACCOUNT_MODE  = "prefix"    # "prefix" or "suffix"
 TIERED_ACCOUNT_VALUE = ""          # e.g. "a-" (prefix) or "-adm" (suffix)
 TIERED_ACCOUNT_SCOPE = "linux"     # "linux" (Linux only) or "both" (Linux + Proxmox/PBS/PDM)
+TIERED_SSH_DENY_DIRECT = False     # Block direct SSH login for tiered accounts; operators log
+                                   # in with the base account and escalate locally (su - <tiered>,
+                                   # then sudo -i). Writes a managed sshd_config.d drop-in.
 
 #--------------------------------------------#
 # Proxmox Backup Server (PBS) integration    #
@@ -469,7 +476,137 @@ def fncMakeTieredUsername(base_unix: str) -> str:
         raw = f"{base_unix}{TIERED_ACCOUNT_VALUE}"
     else:
         raw = f"{TIERED_ACCOUNT_VALUE}{base_unix}"
-    return fncSanitiseUnix(raw)
+    # Tiered account names are always lowercased, independent of USERNAME_LOWERCASE,
+    # so an admin-configured TIERED_ACCOUNT_VALUE with capitals can't leak through.
+    return fncSanitiseUnix(raw.lower())
+
+def _tieredSshGlob() -> str | None:
+    """
+    Build the sshd DenyUsers glob that matches every tiered account, derived
+    from TIERED_ACCOUNT_VALUE. The token is sanitised with the same rules as
+    fncMakeTieredUsername (lowercase, '.'->'_', disallowed chars -> '_') so the
+    pattern matches the names actually created. Returns None when tiered
+    accounts are disabled or no non-empty value is configured -- callers MUST
+    treat None as "do not write a rule" (never fall back to '*').
+    """
+    if not TIERED_ACCOUNTS or not TIERED_ACCOUNT_VALUE:
+        return None
+    tok = TIERED_ACCOUNT_VALUE.replace(".", "_").lower()
+    tok = re.sub(r"[^a-z0-9._-]", "_", tok)
+    if not tok:
+        return None
+    return f"*{tok}" if TIERED_ACCOUNT_MODE == "suffix" else f"{tok}*"
+
+def _reloadSshd(reason: str) -> bool:
+    """Validate sshd config (sshd -t) then reload; never reload an invalid config."""
+    rc, _, err = fncRun("sshd", ["-t"])
+    if rc != 0:
+        logging.error("sshd config validation failed (%s); NOT reloading: %s", reason, err)
+        return False
+    rc, _, err = fncRun("systemctl", ["reload", "ssh"])
+    if rc != 0:
+        logging.error("sshd config valid but 'systemctl reload ssh' failed (%s): %s "
+                      "-- rule will apply on next sshd restart", reason, err)
+        return False
+    logging.info("Reloaded sshd (%s)", reason)
+    return True
+
+def _removeTieredSshDeny():
+    """Remove the managed sshd drop-in (feature disabled / cleanup) and reload."""
+    if not os.path.exists(TIERED_SSHD_DROPIN):
+        return
+    try:
+        _assert_regular_or_missing(TIERED_SSHD_DROPIN)
+        os.remove(TIERED_SSHD_DROPIN)
+        logging.info("Removed tiered SSH deny drop-in %s", TIERED_SSHD_DROPIN)
+        fncAuditEvent("TIERED_SSH_DENY_REMOVED", {"path": TIERED_SSHD_DROPIN})
+        _reloadSshd("tiered SSH deny removed")
+    except Exception as e:
+        logging.error("Failed removing %s: %s", TIERED_SSHD_DROPIN, e)
+
+def fncApplyTieredSshDeny():
+    """
+    Reconcile the managed sshd drop-in that blocks DIRECT SSH login for tiered
+    accounts. The accounts stay fully usable locally (su - <tiered>, then
+    sudo -i) -- only the SSH entry point is closed, so privilege escalation
+    must go through the unprivileged base account.
+
+    Idempotent: only writes + reloads when the rendered file actually changes.
+    Validates with `sshd -t` before reloading and rolls the file back if the
+    resulting config is invalid, so a bad pattern can never lock the host out.
+    """
+    if not TIERED_SSH_DENY_DIRECT:
+        _removeTieredSshDeny()
+        return
+
+    glob = _tieredSshGlob()
+    if not glob or glob == "*":
+        # No safe pattern (tiered accounts off, or empty/degenerate value).
+        # Refuse rather than emit 'DenyUsers *', which would lock everyone out.
+        logging.warning(
+            "TIERED_SSH_DENY_DIRECT enabled but no safe tiered pattern could be "
+            "derived (check TIERED_ACCOUNTS / TIERED_ACCOUNT_VALUE); not writing %s",
+            TIERED_SSHD_DROPIN,
+        )
+        _removeTieredSshDeny()
+        return
+
+    # Lock-out guard: refuse if the pattern would also block root or is too broad.
+    if fnmatch.fnmatch("root", glob):
+        logging.error(
+            "Refusing to write %s: tiered pattern %r also matches 'root' "
+            "(pick a more specific TIERED_ACCOUNT_VALUE)",
+            TIERED_SSHD_DROPIN, glob,
+        )
+        return
+
+    content = (
+        "# Managed by EntramoxReconciler -- do NOT edit by hand.\n"
+        "# Tiered admin accounts must not be reachable via direct SSH.\n"
+        "# Operators log in with their unprivileged base account and escalate\n"
+        "# locally:  su - <tiered-account>  then  sudo -i\n"
+        f"DenyUsers {glob}\n"
+    )
+
+    prev_existed = os.path.exists(TIERED_SSHD_DROPIN)
+    prev_content = ""
+    if prev_existed:
+        try:
+            _assert_regular_or_missing(TIERED_SSHD_DROPIN)
+            with open(TIERED_SSHD_DROPIN, "r") as f:
+                prev_content = f.read()
+        except Exception as e:
+            logging.error("Failed reading %s: %s", TIERED_SSHD_DROPIN, e)
+
+    if prev_existed and prev_content == content:
+        return  # already in the desired state -- no write, no reload
+
+    d = os.path.dirname(TIERED_SSHD_DROPIN)
+    if not os.path.isdir(d):
+        logging.error("sshd drop-in dir %s missing; is OpenSSH installed with "
+                      "'Include %s/*.conf'? Skipping tiered SSH deny.", d, d)
+        return
+
+    _safe_write_atomic(TIERED_SSHD_DROPIN, content, 0o644)
+
+    rc, _, err = fncRun("sshd", ["-t"])
+    if rc != 0:
+        # Roll back so a broken include can never break the running sshd.
+        logging.error("sshd rejected %s (%s); rolling back", TIERED_SSHD_DROPIN, err)
+        try:
+            if prev_existed:
+                _safe_write_atomic(TIERED_SSHD_DROPIN, prev_content, 0o644)
+            else:
+                os.remove(TIERED_SSHD_DROPIN)
+        except Exception as e:
+            logging.error("Rollback of %s failed: %s", TIERED_SSHD_DROPIN, e)
+        return
+
+    logging.info("Wrote tiered SSH deny rule to %s (DenyUsers %s)",
+                 TIERED_SSHD_DROPIN, glob)
+    fncAuditEvent("TIERED_SSH_DENY_APPLIED",
+                  {"path": TIERED_SSHD_DROPIN, "pattern": glob})
+    _reloadSshd("tiered SSH deny applied")
 
 def _lookupUserMeta(upn: str, groups: list[dict]) -> dict:
     """
@@ -662,6 +799,7 @@ TIERED_ACCOUNTS      = _env_bool("TIERED_ACCOUNTS",      TIERED_ACCOUNTS)
 TIERED_ACCOUNT_MODE  = _env_str ("TIERED_ACCOUNT_MODE",  TIERED_ACCOUNT_MODE)
 TIERED_ACCOUNT_VALUE = _env_str ("TIERED_ACCOUNT_VALUE", TIERED_ACCOUNT_VALUE)
 TIERED_ACCOUNT_SCOPE = _env_str ("TIERED_ACCOUNT_SCOPE", TIERED_ACCOUNT_SCOPE)
+TIERED_SSH_DENY_DIRECT = _env_bool("TIERED_SSH_DENY_DIRECT", TIERED_SSH_DENY_DIRECT)
 
 # PBS
 PBS_ENABLED         = _env_bool("PBS_ENABLED",         PBS_ENABLED)
@@ -2400,6 +2538,15 @@ def fncSync():
                     fncSetInitialPassword(tiered_user)
                     logging.info("Created tiered account '%s' for base user '%s'", tiered_user, base_user)
                     fncAuditEvent("TIERED_ACCOUNT_CREATED", {"tiered_user": tiered_user, "base_user": base_user})
+                else:
+                    # Creation failed (see the useradd error logged above). Don't fall
+                    # through to unlock/sudo/GECOS on a user that doesn't exist, and
+                    # don't record it in tiered_known so it's retried next run.
+                    logging.error(
+                        "Skipping tiered account '%s' for '%s': user could not be created",
+                        tiered_user, base_user,
+                    )
+                    continue
 
             if entra_enabled:
                 fncUnlockUser(tiered_user)
@@ -2421,6 +2568,11 @@ def fncSync():
 
             disabled.pop(tiered_user, None)
             tiered_known.add(tiered_user)
+
+    # ── Tiered SSH lockdown ──────────────────────────────────────────────────────
+    # Reconcile the managed sshd drop-in (apply when enabled, clean up when not).
+    # Static glob on the configured prefix/suffix -- no per-user state needed.
+    fncApplyTieredSshDeny()
 
     # ── Persist ─────────────────────────────────────────────────────────────────
     state["known_users"]  = sorted(known)
