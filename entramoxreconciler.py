@@ -98,6 +98,8 @@ BIN = {
   "getent":   "/usr/bin/getent",
   "groupadd": "/usr/sbin/groupadd",
   "gpasswd":  "/usr/bin/gpasswd",
+  "pkill":    "/usr/bin/pkill",
+  "ssh":      "/usr/bin/ssh",
   "sshd":     "/usr/sbin/sshd",
   "systemctl":"/usr/bin/systemctl",
 }
@@ -669,6 +671,31 @@ def _graphFailOrWarn(message: str):
     logging.warning("GRAPH_FAIL_POLICY=permissive: %s - continuing with stale state.", message)
     fncPrintMessage(message, "warning")
 
+def _deriveFirstLast(meta: dict) -> tuple[str | None, str | None]:
+    """
+    Resolve (firstname, lastname) for PVE/PBS/PDM from Graph metadata.
+
+    Prefers explicit givenName/surname, but many Entra tenants populate only
+    displayName (e.g. on-prem-synced or guest accounts), leaving givenName and
+    surname blank. In that case we split displayName: first token -> firstname,
+    remainder -> lastname. Returns (None, None)/(value, None) when a field is
+    unavailable so callers never clobber existing values with empty strings.
+    """
+    given = (meta.get("givenName") or "").strip()
+    surname = (meta.get("surname") or "").strip()
+    if given or surname:
+        return (given or None, surname or None)
+
+    display = (meta.get("displayName") or "").strip()
+    if not display:
+        return (None, None)
+
+    parts = display.split()
+    if len(parts) == 1:
+        return (parts[0], None)
+    return (parts[0], " ".join(parts[1:]))
+
+
 def _buildPveMetaForUpn(upn: str, groups: list[dict]) -> tuple[dict, str]:
     """
     Return (meta_dict, comment_str) for a UPN using Graph group data.
@@ -683,6 +710,14 @@ def _buildPveMetaForUpn(upn: str, groups: list[dict]) -> tuple[dict, str]:
         meta = _lookupUserMeta(upn, groups) if groups else {}
     except Exception as e:
         logging.debug("Metadata lookup failed for %s: %s", upn, e)
+
+    # Backfill firstname/lastname from displayName when Entra leaves givenName/
+    # surname blank, so PVE/PBS/PDM show a real name instead of just the userid.
+    fn, ln = _deriveFirstLast(meta)
+    if fn and not (meta.get("givenName") or "").strip():
+        meta["givenName"] = fn
+    if ln and not (meta.get("surname") or "").strip():
+        meta["surname"] = ln
 
     if src_labels:
         if len(src_labels) == 1:
@@ -824,6 +859,19 @@ PDM_TOKEN_VALUE_ENC = _env_str ("PDM_TOKEN_VALUE_ENC", PDM_TOKEN_VALUE_ENC)
 PDM_DEFAULT_ROLE    = _env_str ("PDM_DEFAULT_ROLE",    PDM_DEFAULT_ROLE)
 PDM_ADMIN_ROLE      = _env_str ("PDM_ADMIN_ROLE",      PDM_ADMIN_ROLE)
 PDM_VERIFY_TLS      = _env_bool("PDM_VERIFY_TLS",      PDM_VERIFY_TLS)
+
+# ── Multi-host fan-out (replicate Linux accounts to other nodes over SSH) ──────
+# When enabled, THIS host pushes the same Linux user/sudo/tiered account changes
+# to FANOUT_NODES over SSH using the installer-provisioned key. Off by default
+# (each host runs the reconciler independently).
+FANOUT_ENABLED      = _env_bool("FANOUT_ENABLED",  False)
+FANOUT_NODES        = _env_list("FANOUT_NODES",    [])
+FANOUT_SSH_USER     = _env_str ("FANOUT_SSH_USER", "root")
+_fanout_port_raw    = os.getenv("FANOUT_SSH_PORT", "22").strip()
+FANOUT_SSH_PORT     = int(_fanout_port_raw) if _fanout_port_raw.isdigit() else 22
+SSH_KEY_PATH            = _env_str("SSH_KEY_PATH", "")
+SSH_KEY_PASSPHRASE_ENC  = _env_str("SSH_KEY_PASSPHRASE_ENC", "")
+FANOUT_KNOWN_HOSTS  = os.path.join(STATE_DIR, "fanout_known_hosts")
 
 # Fernet secret rotation enforcement
 _fernet_age = os.getenv("FERNET_MAX_AGE_DAYS", "").strip()
@@ -1043,13 +1091,15 @@ def fncPveUserModify(upn: str,
     Update PVE user metadata (email/comment/firstname/lastname). No-op if nothing passed.
     """
     args = ["user", "modify", fncPveUseridFromUpn(upn)]
-    if email is not None:
+    # Truthiness (not "is not None") so blank values don't overwrite existing
+    # PVE metadata with empty strings.
+    if email:
         args += ["-email", email]
     if comment:
         args += ["-comment", comment]
-    if firstname is not None:
+    if firstname:
         args += ["-firstname", firstname]
-    if lastname is not None:
+    if lastname:
         args += ["-lastname", lastname]
 
     if len(args) == 3:  # nothing to change
@@ -1210,6 +1260,7 @@ def fncSetLinuxGecos(user: str, comment: str) -> bool:
     safe_comment = (comment or "").replace(":", ";").replace("\n", " ").strip()
     if not safe_comment:
         return False
+    _fanoutAdd(f"usermod -c {_shq(safe_comment)} {_shq(user)} 2>/dev/null || true")
     current = fncGetLinuxGecos(user)
     if current == safe_comment:
         return False
@@ -1254,6 +1305,10 @@ def fncAddUserToGroups(user: str, groups: list[str]) -> bool:
     changed = False
     for g in groups:
         if g:
+            _fanoutAdd(
+                f"getent group {_shq(g)} >/dev/null 2>&1 || groupadd {_shq(g)}; "
+                f"id -u {_shq(user)} >/dev/null 2>&1 && usermod -aG {_shq(g)} {_shq(user)} 2>/dev/null || true"
+            )
             changed |= fncEnsureUserGroup(user, g, present=True)
     if not changed:
         logging.debug("User %s already in groups %s; no change", user, groups)
@@ -1263,6 +1318,7 @@ def fncAddUserToGroups(user: str, groups: list[str]) -> bool:
 # Purpose : Backwards-compat wrapper to remove a single group.
 # Notes   : Delegates to fncEnsureUserGroup(..., present=False).
 def fncRemoveUserFromGroup(user: str, group: str) -> bool:
+    _fanoutAdd(f"gpasswd -d {_shq(user)} {_shq(group)} 2>/dev/null || true")
     return fncEnsureUserGroup(user, group, present=False)
 
 # Function: fncResolveUpnForUnix
@@ -1304,6 +1360,8 @@ def fncIsLocked(user: str) -> bool:
 # Purpose : Ensure a user account is locked (True) or unlocked (False).
 # Notes   : Idempotent; returns when already in desired state.
 def fncSetLocked(user: str, locked: bool):
+    # Record remote intent regardless of local state so nodes converge.
+    _fanoutAdd(f"usermod -{'L' if locked else 'U'} {_shq(user)} 2>/dev/null || true")
     if locked and fncIsLocked(user):
         logging.debug("User %s already locked; no change", user)
         return
@@ -1330,15 +1388,39 @@ def fncUnlockUser(user: str):
 
 # Function: fncDeleteUser
 # Purpose : Remove local user and home; clean up sudoers first.
-# Notes   : Logs errors; safe if user missing (userdel -r will error, we log).
-def fncDeleteUser(user: str):
+# Notes   : Returns True only if the account is gone afterwards. Kills the user's
+#           processes/sessions (best-effort) and falls back to `userdel -f` so a
+#           logged-in user or busy home directory can't silently block deletion.
+def fncDeleteUser(user: str) -> bool:
     fncRemoveSudoers(user)
+    _fanoutAdd(
+        f"pkill -KILL -u {_shq(user)} 2>/dev/null; "
+        f"userdel -r {_shq(user)} 2>/dev/null || userdel -rf {_shq(user)} 2>/dev/null || true"
+    )
+
+    # Best-effort: terminate any processes/sessions still owned by the user so
+    # `userdel` doesn't refuse with "currently used by process". pkill is
+    # optional -- a missing binary (rc 127) or "no matches" (rc 1) is fine.
+    if fncUserExists(user):
+        rc_k, _, _ = fncRun("pkill", ["-KILL", "-u", user])
+        if rc_k not in (0, 1, 127):
+            logging.debug("pkill -u %s returned rc=%s", user, rc_k)
+
     rc, _, err = fncRun("userdel", ["-r", user])
     if rc != 0:
+        # Retry with force: removes the account even if it's still considered
+        # "in use" and forces home/mail removal. Handles the common cases where
+        # a plain `userdel -r` fails and would otherwise stall deletion forever.
+        logging.warning("userdel -r failed for %s (%s); retrying with -f", user, err)
+        rc, _, err = fncRun("userdel", ["-rf", user])
+
+    if rc != 0 and fncUserExists(user):
         logging.error("Failed to delete user %s: %s", user, err)
-    else:
-        logging.info("Deleted user (and home): %s", user)
-        fncAuditEvent("USER_DELETED", {"user": user})
+        return False
+
+    logging.info("Deleted user (and home): %s", user)
+    fncAuditEvent("USER_DELETED", {"user": user})
+    return True
 
 # Function: fncGrantSudo
 # Purpose : Ensure a per-user sudoers file exists with desired NOPASSWD policy.
@@ -1346,6 +1428,7 @@ def fncDeleteUser(user: str):
 def fncGrantSudo(user: str) -> bool:
     path = f"{MANAGED_SUDOERS_PREFIX}{user}"
     expected = f"{user} ALL=(ALL) {'NOPASSWD:ALL' if SUDO_NOPASSWD else 'ALL'}\n"
+    _fanoutAdd(f"printf '%s' {_shq(expected)} > {_shq(path)} && chmod 0440 {_shq(path)}")
 
     current = ""
     if os.path.exists(path):
@@ -1385,6 +1468,7 @@ def fncGrantSudo(user: str) -> bool:
 # Notes   : No error if missing; logs failures.
 def fncRemoveSudoers(user: str):
     path = f"{MANAGED_SUDOERS_PREFIX}{user}"
+    _fanoutAdd(f"rm -f {_shq(path)}")
     try:
         if os.path.exists(path):
             os.remove(path)
@@ -1536,6 +1620,21 @@ def fncPveUserSetEnabled(upn: str, enabled: bool) -> bool:
         logging.error("PVE user set enabled failed for %s: %s", userid, err)
         return False
     logging.info("PVE user %s set enable=%s", userid, int(enabled))
+    return True
+
+# Function: fncPveDeleteUser
+# Purpose : Delete a PVE user entirely (not just disable) once grace expires.
+# Notes   : Returns True if the user is gone afterwards (deleted now or already absent).
+def fncPveDeleteUser(upn: str) -> bool:
+    userid = fncPveUseridFromUpn(upn)
+    if not fncPveUserExists(userid):
+        return True  # already gone
+    rc, _, err = fncRun("pveum", ["user", "delete", userid])
+    if rc != 0:
+        logging.error("PVE user delete failed for %s: %s", userid, err)
+        return False
+    logging.info("PVE user deleted: %s", userid)
+    fncAuditEvent("PVE_USER_DELETED", {"userid": userid})
     return True
 
 # Function: fncPveEnsureAclRoles
@@ -1784,6 +1883,27 @@ def fncPbsUserSetEnabled(upn: str, enabled: bool) -> bool:
     fncAuditEvent("PBS_USER_TOGGLED", {"userid": userid, "enabled": enabled})
     return True
 
+def fncPbsDeleteUser(upn: str) -> bool:
+    """Delete a PBS user entirely. Returns True if the user is gone afterwards."""
+    if not PBS_ENABLED or not PBS_HOST:
+        return True  # nothing to purge
+    userid = fncPbsUseridFromUpn(upn)
+    auth = _fncPbsAuthHeader()
+    if not auth:
+        logging.error("PBS auth header missing; cannot delete %s", userid)
+        return False
+    if not fncPbsUserExists(userid):
+        return True  # already gone
+    resp = _fncRemoteApiRequest(
+        _fncPbsBaseUrl(), f"access/users/{_urlparse.quote(userid, safe='')}",
+        method="DELETE", auth_header=auth, verify_tls=PBS_VERIFY_TLS)
+    if resp is None:
+        logging.error("PBS user delete failed for %s", userid)
+        return False
+    logging.info("PBS user deleted: %s", userid)
+    fncAuditEvent("PBS_USER_DELETED", {"userid": userid})
+    return True
+
 
 #=================================#
 # Proxmox Datacenter Manager (PDM)#
@@ -1887,6 +2007,27 @@ def fncPdmUserSetEnabled(upn: str, enabled: bool) -> bool:
         return False
     logging.info("PDM user %s set enable=%s", userid, int(enabled))
     fncAuditEvent("PDM_USER_TOGGLED", {"userid": userid, "enabled": enabled})
+    return True
+
+def fncPdmDeleteUser(upn: str) -> bool:
+    """Delete a PDM user entirely. Returns True if the user is gone afterwards."""
+    if not PDM_ENABLED or not PDM_HOST:
+        return True  # nothing to purge
+    userid = fncPdmUseridFromUpn(upn)
+    auth = _fncPdmAuthHeader()
+    if not auth:
+        logging.error("PDM auth header missing; cannot delete %s", userid)
+        return False
+    if not fncPdmUserExists(userid):
+        return True  # already gone
+    resp = _fncRemoteApiRequest(
+        _fncPdmBaseUrl(), f"access/users/{_urlparse.quote(userid, safe='')}",
+        method="DELETE", auth_header=auth, verify_tls=PDM_VERIFY_TLS)
+    if resp is None:
+        logging.error("PDM user delete failed for %s", userid)
+        return False
+    logging.info("PDM user deleted: %s", userid)
+    fncAuditEvent("PDM_USER_DELETED", {"userid": userid})
     return True
 
 
@@ -2199,6 +2340,34 @@ def _computeDesiredFromGraph(groups: list[dict]) -> tuple[
     return desired, user_roles_by_upn, unix_to_upn, upn_enabled_global, in_allusers_upn, in_superadmin_upn
 
 
+# Function: _purgeRemoteAccounts
+# Purpose : Delete the PVE (and PBS/PDM when enabled) accounts for a UPN.
+# Notes   : Returns True only if every targeted account is gone afterwards, so the
+#           caller can keep retrying until removal is fully complete.
+def _purgeRemoteAccounts(upn: str) -> bool:
+    ok = True
+    try:
+        if not fncPveDeleteUser(upn):
+            ok = False
+    except Exception as e:
+        logging.error("PVE delete failed for %s: %s", upn, e)
+        ok = False
+    if PBS_ENABLED:
+        try:
+            if not fncPbsDeleteUser(upn):
+                ok = False
+        except Exception as e:
+            logging.error("PBS delete failed for %s: %s", upn, e)
+            ok = False
+    if PDM_ENABLED:
+        try:
+            if not fncPdmDeleteUser(upn):
+                ok = False
+        except Exception as e:
+            logging.error("PDM delete failed for %s: %s", upn, e)
+            ok = False
+    return ok
+
 # Function: _disablePveIfKnown
 # Purpose : Try to disable the PVE account for a unix user every run (idempotent).
 # Notes   : Resolves UPN via current map or by scanning PVE users; harmless if already disabled.
@@ -2222,6 +2391,14 @@ def _graceDeleteOrCountdown(user: str, disabled: dict, known: set, unix_to_upn: 
         return
 
     if not fncUserExists(user):
+        # Linux account already gone. If we were mid-removal, make sure the
+        # PVE/PBS/PDM counterparts are deleted too before clearing state; if that
+        # purge can't complete, keep state so it's retried next run.
+        if user in disabled:
+            upn = unix_to_upn.get(user) or fncResolveUpnForUnix(user)
+            if upn and not _purgeRemoteAccounts(upn):
+                logging.warning("Remote purge for %s incomplete; will retry next run", user)
+                return
         disabled.pop(user, None)
         known.discard(user)
         return
@@ -2270,9 +2447,21 @@ def _graceDeleteOrCountdown(user: str, disabled: dict, known: set, unix_to_upn: 
     # Expiry check
     if now - locked_at >= DELETE_AFTER:
         logging.info("User %s disabled for >= %s; deleting", user, str(DELETE_AFTER))
-        fncDeleteUser(user)
-        disabled.pop(user, None)
-        known.discard(user)
+        upn = unix_to_upn.get(user) or fncResolveUpnForUnix(user)
+        linux_ok  = fncDeleteUser(user)
+        remote_ok = _purgeRemoteAccounts(upn) if upn else True
+
+        # Only forget the user once removal is actually complete. Clearing state
+        # on a failed delete would make the next run treat the still-present user
+        # as "first seen", resetting the grace timer and looping forever.
+        if linux_ok and remote_ok:
+            disabled.pop(user, None)
+            known.discard(user)
+        else:
+            logging.warning(
+                "Removal of %s incomplete (linux_ok=%s remote_ok=%s); will retry next run",
+                user, linux_ok, remote_ok
+            )
     else:
         remain = DELETE_AFTER - (now - locked_at)
         logging.info("User %s still in grace; %s remaining", user, str(remain).split(".")[0])
@@ -2285,6 +2474,151 @@ def _ensureBaselineGroups(user: str):
     non_priv_groups = [g for g in (EXTRA_GROUPS or []) if g and g != "sudo"]
     if non_priv_groups:
         fncAddUserToGroups(user, non_priv_groups)
+
+
+#==================================================================#
+#        Multi-host fan-out (replicate Linux accounts via SSH)     #
+#==================================================================#
+# When FANOUT_ENABLED, this host pushes the same Linux account operations
+# (ensure/lock/unlock/sudo/tiered/delete) to FANOUT_NODES over SSH using the
+# installer-provisioned, passphrase-protected key. Each mutator records an
+# idempotent /bin/sh snippet; all snippets are flushed to every node in a single
+# SSH call per node at the end of the run, so nodes converge to the same state
+# even if one was briefly unreachable. PVE/PBS/PDM are NOT fanned out: PVE
+# clusters replicate their own user DB and PBS/PDM are managed via their APIs.
+
+_FANOUT_LINES: list[str] = []           # accumulated idempotent shell snippets
+_FANOUT_PASSPHRASE: str | None = None   # decrypted SSH key passphrase (memory only)
+_FANOUT_READY = False                   # set once setup succeeds for this run
+_FANOUT_ASKPASS = os.path.join(STATE_DIR, ".fanout-askpass")
+
+def _shq(value) -> str:
+    """POSIX single-quote a value for safe shell interpolation."""
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+def fncFanoutEnabled() -> bool:
+    """True when fan-out is configured (does not imply the key is usable)."""
+    return bool(FANOUT_ENABLED and FANOUT_NODES and SSH_KEY_PATH)
+
+def _fanoutAdd(snippet: str):
+    """Record an idempotent shell snippet to replicate to every node."""
+    if _FANOUT_READY:
+        _FANOUT_LINES.append(snippet)
+
+def _fanoutEnsureAccount(user: str):
+    """Ensure the account exists on every node (idempotent), with a node-local
+    random password so a later `usermod -U` (unlock) can't fail on an empty
+    password. Emitted every run so a recovered node self-heals."""
+    _fanoutAdd(
+        f"id -u {_shq(user)} >/dev/null 2>&1 || "
+        f"{{ useradd -m -s {_shq(DEFAULT_SHELL)} {_shq(user)} && "
+        f"printf '%s:%s\\n' {_shq(user)} \"$(head -c 32 /dev/urandom | base64)\" | chpasswd; }}"
+    )
+
+def _fanoutDecryptPassphrase() -> str | None:
+    """Decrypt the SSH key passphrase. Non-fatal: returns None on failure so a
+    bad/locked-out fan-out key never aborts the local reconciliation."""
+    enc = SSH_KEY_PASSPHRASE_ENC
+    if not enc:
+        return ""  # key has no passphrase
+    if not enc.startswith("fernet:"):
+        return enc  # plaintext (discouraged, but usable)
+    key_b64 = os.getenv("ENTRAMOX_ENC_KEY", "").strip()
+    if not key_b64:
+        logging.error("Fan-out: ENTRAMOX_ENC_KEY missing; cannot decrypt SSH passphrase.")
+        return None
+    try:
+        from cryptography.fernet import Fernet
+        return Fernet(key_b64.encode()).decrypt(enc.split(":", 1)[1].encode()).decode()
+    except Exception as e:
+        logging.error("Fan-out: failed to decrypt SSH key passphrase: %s", e)
+        return None
+
+def fncFanoutSetup():
+    """Prepare fan-out for this run: decrypt the key passphrase and write the
+    askpass helper. Leaves _FANOUT_READY False (fan-out skipped) on any problem."""
+    global _FANOUT_READY, _FANOUT_PASSPHRASE
+    if not fncFanoutEnabled():
+        return
+    if not os.path.exists(SSH_KEY_PATH):
+        logging.error("Fan-out enabled but SSH key missing at %s; skipping fan-out this run.", SSH_KEY_PATH)
+        return
+    pp = _fanoutDecryptPassphrase()
+    if pp is None:
+        logging.error("Fan-out disabled this run (SSH key passphrase unavailable).")
+        return
+    _FANOUT_PASSPHRASE = pp
+    # askpass helper feeds the passphrase from the environment (no secret on disk).
+    try:
+        _safe_write_atomic(_FANOUT_ASKPASS,
+                           "#!/bin/sh\nprintf '%s\\n' \"${ENTRAMOX_KEY_PP:-}\"\n",
+                           mode=0o700)
+    except Exception as e:
+        logging.error("Fan-out: could not write askpass helper: %s", e)
+        return
+    _FANOUT_READY = True
+    logging.info("Fan-out enabled: %d node(s), ssh %s@<node>:%d, key=%s",
+                 len(FANOUT_NODES), FANOUT_SSH_USER, FANOUT_SSH_PORT, SSH_KEY_PATH)
+
+def _fanoutSshOnce(node: str, remote_cmd: str, input_data: str | None = None) -> tuple[int, str, str]:
+    """Run a command on one node over SSH using the agent-less askpass flow."""
+    ssh = BIN.get("ssh")
+    if not ssh or not os.path.exists(ssh):
+        return 127, "", "ssh binary not found"
+    env = dict(os.environ)
+    env["SSH_ASKPASS"] = _FANOUT_ASKPASS
+    env["SSH_ASKPASS_REQUIRE"] = "force"           # OpenSSH >= 8.4: use askpass even with a tty
+    env.setdefault("DISPLAY", ":0")                 # older OpenSSH fallback
+    env["ENTRAMOX_KEY_PP"] = _FANOUT_PASSPHRASE or ""
+    args = [
+        ssh, "-i", SSH_KEY_PATH, "-p", str(FANOUT_SSH_PORT),
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", f"UserKnownHostsFile={FANOUT_KNOWN_HOSTS}",
+        "-o", "PreferredAuthentications=publickey",
+        "-o", "PasswordAuthentication=no",
+        "-o", "KbdInteractiveAuthentication=no",
+        "-o", "ConnectTimeout=10",
+        f"{FANOUT_SSH_USER}@{node}", remote_cmd,
+    ]
+    try:
+        p = subprocess.run(args, input=input_data, capture_output=True, text=True,
+                           start_new_session=True, env=env)
+        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+    except Exception as e:
+        return 1, "", str(e)
+
+def fncFanoutFlush():
+    """Apply all accumulated snippets to every node in a single SSH call each."""
+    if not _FANOUT_READY or not _FANOUT_LINES:
+        return
+    try:
+        os.makedirs(os.path.dirname(FANOUT_KNOWN_HOSTS), exist_ok=True)
+    except Exception:
+        pass
+    # No `set -e`: each op is best-effort and independently idempotent.
+    script = "\n".join(_FANOUT_LINES) + "\n"
+    ok = 0
+    for node in FANOUT_NODES:
+        rc, out, err = _fanoutSshOnce(node, "/bin/sh -s", input_data=script)
+        if rc == 0:
+            ok += 1
+            logging.info("Fan-out applied to %s (%d ops)", node, len(_FANOUT_LINES))
+            fncAuditEvent("FANOUT_APPLIED", {"node": node, "ops": len(_FANOUT_LINES)})
+        else:
+            logging.error("Fan-out to %s failed rc=%s: %s", node, rc, (err or out)[:300])
+            fncAuditEvent("FANOUT_FAILED", {"node": node, "rc": rc})
+    logging.info("Fan-out complete: %d/%d node(s) ok", ok, len(FANOUT_NODES))
+
+def fncFanoutTeardown():
+    """Remove the askpass helper and clear the in-memory passphrase."""
+    global _FANOUT_PASSPHRASE, _FANOUT_READY
+    try:
+        if os.path.exists(_FANOUT_ASKPASS):
+            os.remove(_FANOUT_ASKPASS)
+    except Exception:
+        pass
+    _FANOUT_PASSPHRASE = None
+    _FANOUT_READY = False
 
 
 # Function: fncSync
@@ -2301,6 +2635,9 @@ def fncSync():
     known        = set(state.get("known_users", []))
     disabled     = state.get("disabled", {})      # {username: iso_timestamp_locked}
     tiered_known = set(state.get("tiered_users", []))  # tiered account names
+
+    # Prepare multi-host fan-out for this run (no-op unless FANOUT_ENABLED).
+    fncFanoutSetup()
 
     # ── Pull Graph ─────────────────────────────────────────────────────────────
     groups: list[dict] = []
@@ -2358,7 +2695,11 @@ def fncSync():
             fncRemoveSudoers(tiered_user)
             fncRemoveUserFromGroup(tiered_user, "sudo")
             fncLockUser(tiered_user)
-            fncDeleteUser(tiered_user)
+            if not fncDeleteUser(tiered_user):
+                # Keep it tracked so we retry next run instead of forgetting a
+                # tiered account that still exists with sudo stripped/locked.
+                logging.warning("Tiered account %s deletion incomplete; will retry next run", tiered_user)
+                continue
             logging.info("Tiered account removed (no longer superadmin): %s", tiered_user)
             fncAuditEvent("TIERED_ACCOUNT_DELETED", {"tiered_user": tiered_user})
         disabled.pop(tiered_user, None)
@@ -2402,6 +2743,7 @@ def fncSync():
 
         # ── Entra-disabled: in group but account disabled in Entra ──────────────
         if not entra_enabled:
+            _fanoutEnsureAccount(user)
             fncLockUser(user)
             disabled.pop(user, None)
             fncRemoveSudoers(user)
@@ -2432,6 +2774,7 @@ def fncSync():
             continue
 
         # ── Entra enabled ────────────────────────────────────────────────────────
+        _fanoutEnsureAccount(user)
         fncUnlockUser(user)
         _ensureBaselineGroups(user)
 
@@ -2446,7 +2789,7 @@ def fncSync():
         fncSetLinuxGecos(user, gecos)
 
         # ── SUDO policy ──────────────────────────────────────────────────────────
-        # When tiered accounts are active the BASE account gets NO sudo — privileges
+        # When tiered accounts are active the BASE account gets NO sudo - privileges
         # live exclusively in the tiered account (created below).
         tiered_active = TIERED_ACCOUNTS and bool(TIERED_ACCOUNT_VALUE)
         if is_superadmin:
@@ -2548,6 +2891,7 @@ def fncSync():
                     )
                     continue
 
+            _fanoutEnsureAccount(tiered_user)
             if entra_enabled:
                 fncUnlockUser(tiered_user)
                 _ensureBaselineGroups(tiered_user)
@@ -2573,6 +2917,9 @@ def fncSync():
     # Reconcile the managed sshd drop-in (apply when enabled, clean up when not).
     # Static glob on the configured prefix/suffix -- no per-user state needed.
     fncApplyTieredSshDeny()
+
+    # ── Fan-out: replicate all accumulated account ops to the other nodes ─────────
+    fncFanoutFlush()
 
     # ── Persist ─────────────────────────────────────────────────────────────────
     state["known_users"]  = sorted(known)
@@ -2605,6 +2952,9 @@ def fncMain():
     except Exception as e:
         logging.exception("Unhandled exception: %s", e)
         sys.exit(1)
+    finally:
+        # Always clear the fan-out askpass helper / in-memory passphrase.
+        fncFanoutTeardown()
 
 if __name__ == "__main__":
     fncCheckPyVersion()

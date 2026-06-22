@@ -5,6 +5,7 @@ import shutil
 import hashlib
 import subprocess
 import random
+import secrets
 import argparse
 from pathlib import Path
 import json
@@ -31,15 +32,23 @@ LOGDIR     = Path("/var/log/entramoxreconciler")
 ENVFILE    = Path("/etc/entramoxreconciler.env")
 KEYFILE    = Path("/etc/entramoxreconciler.key")
 
-# Per-service credential directory — secrets split from the main env file.
+# Per-service credential directory - secrets split from the main env file.
 # Each file is mode 0600 so a compromise of one service's token does not
 # expose the others. The directory itself is mode 0700.
 CONF_DIR    = Path("/etc/entramoxreconciler")
 GRAPH_ENVFILE = CONF_DIR / "graph.env"   # ENTR_CLNT_SEC_ENC / GRAPH_ACCESS_TOKEN
 PBS_ENVFILE   = CONF_DIR / "pbs.env"     # PBS_TOKEN_VALUE_ENC
 PDM_ENVFILE   = CONF_DIR / "pdm.env"     # PDM_TOKEN_VALUE_ENC
+SSH_ENVFILE   = CONF_DIR / "ssh.env"     # SSH_KEY_PASSPHRASE_ENC
 
-# Separate baseline file — stores expected hashes independently of the
+# SSH key used to reach the remote Proxmox services (PBS/PDM). The private key
+# and its (encrypted) passphrase stay on this host; the public key is handed to
+# the operator to install on each remote host.
+SSH_KEYDIR      = CONF_DIR / "ssh"
+SSH_KEY_PATH    = SSH_KEYDIR / "id_ed25519"
+SSH_PUBKEY_NAME = "entramox_ssh_ed25519.pub"   # copy dropped in the CWD
+
+# Separate baseline file - stores expected hashes independently of the
 # checker script so an attacker cannot just replace both atomically.
 BASELINE   = CONF_DIR / "baseline.sha256"
 
@@ -47,6 +56,7 @@ BASELINE   = CONF_DIR / "baseline.sha256"
 _GRAPH_SECRET_VARS = {"ENTR_CLNT_SEC_ENC", "GRAPH_ACCESS_TOKEN"}
 _PBS_SECRET_VARS   = {"PBS_TOKEN_VALUE_ENC"}
 _PDM_SECRET_VARS   = {"PDM_TOKEN_VALUE_ENC"}
+_SSH_SECRET_VARS   = {"SSH_KEY_PASSPHRASE_ENC"}
 
 # Encryption key env var name
 ENC_KEY_ENV = "ENTRAMOX_ENC_KEY"
@@ -97,7 +107,7 @@ VERSION_INFO = f"""
 |             multi-group user descriptions,  |
 |             structured SIEM audit log,      |
 |             improved security model.        |
-| 10/04/2026: Security hardening — Fernet TTL,|
+| 10/04/2026: Security hardening - Fernet TTL,|
 |             split credential files, retry  |
 |             backoff, MAX_USERS_PER_RUN,     |
 |             GRAPH_FAIL_POLICY, stale lock   |
@@ -326,7 +336,7 @@ def fncEncryptIfNeededInEnv(env_path: Path = ENVFILE):
 # Interactive prompts
 # ============================
 def fncPromptUseGraph() -> bool:
-    fncHeading("\n== Entramox Reconciler — Membership Source ==")
+    fncHeading("\n== Entramox Reconciler - Membership Source ==")
     print(f"{fncColor('[1]', 'white')} Use {fncColor('Microsoft Graph', 'cyan')} (enforce members from an Entra group)")
     print(f"{fncColor('[2]', 'white')} Rely on {fncColor('PVE realm accounts only', 'yellow')} (no Graph enforcement)")
     while True:
@@ -337,8 +347,8 @@ def fncPromptUseGraph() -> bool:
 
 def fncPromptAuthMode() -> str:
     fncHeading("\n== Microsoft Graph authentication mode ==")
-    print(f"{fncColor('[1]', 'white')} Access Token ({fncColor('GRAPH_ACCESS_TOKEN', 'magenta')}) — quick testing; short-lived")
-    print(f"{fncColor('[2]', 'white')} Application Tokens (Client Credentials) — "
+    print(f"{fncColor('[1]', 'white')} Access Token ({fncColor('GRAPH_ACCESS_TOKEN', 'magenta')}) - quick testing; short-lived")
+    print(f"{fncColor('[2]', 'white')} Application Tokens (Client Credentials) - "
           f"{fncColor('ENTR_TENANT_ID', 'magenta')}/{fncColor('ENTR_CLNT_ID', 'magenta')}/{fncColor('ENTR_CLNT_SEC', 'magenta')}")
     while True:
         choice = input(f"{fncColor('?', 'cyan')} Choose {fncColor('1', 'white')} or {fncColor('2', 'white')} [{fncColor('2', 'green')}]: ").strip() or "2"
@@ -407,6 +417,127 @@ def fncPromptRoleMappings() -> list[dict]:
 # ============================
 # Build env content
 # ============================
+def _read_env_var_from_file(path: Path, key: str) -> str | None:
+    """Return the value of KEY=... from an env file (quoted or bare), or None."""
+    try:
+        if not path.exists():
+            return None
+        for line in path.read_text().splitlines():
+            m = ENV_ASSIGN_RE.match(line.strip())
+            if m and m.group(1) == key:
+                return m.group(2) or m.group(3) or m.group(4) or ""
+    except Exception:
+        return None
+    return None
+
+
+def fncProvisionSshKey(targets: list[tuple[str, str, str]]) -> list[str]:
+    """
+    Provision a passphrase-protected ed25519 SSH key for reaching the remote
+    hosts that need it (PBS/PDM and/or fan-out nodes).
+
+    The private key and its passphrase stay on this host: the passphrase is
+    Fernet-encrypted into the env (SSH_KEY_PASSPHRASE_ENC), the keypair lives
+    under CONF_DIR/ssh, the public key is also dropped in the current directory,
+    and the operator is shown how to install it on each remote host.
+
+    `targets` is a list of (label, host, ssh_user) tuples for the hosts that need
+    the key installed. Returns env lines to merge into the generated env content.
+    Non-fatal: any failure warns and returns [] so the install still completes.
+    """
+    print()
+    fncHeading("== SSH key for remote hosts (PBS/PDM and/or fan-out nodes) ==")
+
+    if not shutil.which("ssh-keygen"):
+        fncWarn("ssh-keygen not found (install openssh-client). Skipping SSH key generation.")
+        return []
+
+    enc_key = fncLoadEncKey()
+    if not enc_key:
+        fncErr(f"Missing encryption key. Expected {KEYFILE} with {ENC_KEY_ENV}. Skipping SSH key.")
+        return []
+
+    try:
+        SSH_KEYDIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(CONF_DIR, 0o700)
+        os.chmod(SSH_KEYDIR, 0o700)
+    except Exception as e:
+        fncErr(f"Could not create SSH key directory {SSH_KEYDIR}: {e}")
+        return []
+
+    pub_path = SSH_KEY_PATH.with_suffix(".pub")
+    env_lines = [
+        "",
+        "# SSH key for remote Proxmox services (PBS/PDM)",
+        f"SSH_KEY_PATH={fncShQuote(str(SSH_KEY_PATH))}",
+    ]
+
+    if SSH_KEY_PATH.exists():
+        # Wizard re-run: keep the existing key (its passphrase can't be
+        # recovered to re-encrypt) and preserve the already-stored passphrase
+        # so re-writing the env files doesn't drop it.
+        fncWarn(f"SSH key already exists at {SSH_KEY_PATH}; keeping it.")
+        fncInfo("Delete it and re-run the wizard if you want a fresh key.")
+        existing = _read_env_var_from_file(SSH_ENVFILE, "SSH_KEY_PASSPHRASE_ENC")
+        if existing:
+            env_lines.append(f"SSH_KEY_PASSPHRASE_ENC={fncShQuote(existing)}")
+        else:
+            fncWarn("Could not find the stored passphrase for the existing key.")
+    else:
+        passphrase = secrets.token_urlsafe(32)
+        proc = subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-a", "100",
+             "-N", passphrase, "-C", "entramoxreconciler",
+             "-f", str(SSH_KEY_PATH)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            fncErr(f"ssh-keygen failed: {(proc.stderr or proc.stdout).strip()}")
+            return []
+        try:
+            os.chmod(SSH_KEY_PATH, 0o600)
+            os.chmod(pub_path, 0o644)
+        except Exception:
+            pass
+        try:
+            enc_pass = fncEncryptSecretFernet(passphrase, enc_key)
+        except Exception as e:
+            fncErr(f"Failed to encrypt SSH passphrase: {e}")
+            return []
+        env_lines.append(f"SSH_KEY_PASSPHRASE_ENC={fncShQuote(enc_pass)}")
+        fncOk(f"Generated ed25519 SSH key: {fncColor(str(SSH_KEY_PATH), 'white', 'bold')}")
+        fncOk("SSH key passphrase encrypted and stored.")
+
+    # Read the public key and drop a copy in the current working directory.
+    try:
+        pub_text = pub_path.read_text().strip()
+    except Exception as e:
+        fncWarn(f"Could not read public key {pub_path}: {e}")
+        return env_lines
+
+    cwd_pub = Path.cwd() / SSH_PUBKEY_NAME
+    try:
+        cwd_pub.write_text(pub_text + "\n")
+        os.chmod(cwd_pub, 0o644)
+        fncOk("Public key copied to " + fncColor(str(cwd_pub), "white", "bold"))
+    except Exception as e:
+        fncWarn(f"Could not write public key to {cwd_pub}: {e}")
+
+    # Operator instructions
+    print()
+    fncHeading("== ACTION REQUIRED: install this public key on the remote host(s) ==")
+    fncInfo("Append the key below to ~/.ssh/authorized_keys for the login user on each host:")
+    print(fncColor("  " + pub_text, "green"))
+    for label, host, ssh_user in targets:
+        if not host:
+            continue
+        fncInfo(f"{label} ({host}): "
+                + fncColor(f"ssh-copy-id -i {pub_path} {ssh_user}@{host}", "white", "bold"))
+    fncInfo("(or paste it manually if password SSH login is disabled on the remote).")
+
+    return env_lines
+
+
 def fncBuildEnvfileContent() -> str:
     import re
     from getpass import getpass
@@ -442,7 +573,7 @@ def fncBuildEnvfileContent() -> str:
         return " ".join(sorted(set(parts)))
 
     print()
-    fncHeading("== Entramox Reconciler — Runtime configuration ==")
+    fncHeading("== Entramox Reconciler - Runtime configuration ==")
     realm = ask_nonempty("Proxmox Realm name (must match PVE exactly)")
     shell = ask_nonempty("Default shell for new users", default="/bin/bash")
     domains = ask_domains()
@@ -460,7 +591,7 @@ def fncBuildEnvfileContent() -> str:
     ]
 
     if not fncPromptUseGraph():
-        fncWarn("Graph enforcement disabled — relying on PVE realm only.")
+        fncWarn("Graph enforcement disabled - relying on PVE realm only.")
         lines += [
             "GRAPH_ENFORCE='false'",
             "GRAPH_FAIL_OPEN='true'",
@@ -478,7 +609,7 @@ def fncBuildEnvfileContent() -> str:
 
     print()
     fncHeading("== All Users (baseline) group ==")
-    all_gid = ask_nonempty("All Users Entra group — Object ID (ENTRA_ALLUSERS_GROUP_ID)")
+    all_gid = ask_nonempty("All Users Entra group - Object ID (ENTRA_ALLUSERS_GROUP_ID)")
     lines.append(f"ENTRA_ALLUSERS_GROUP_ID={fncShQuote(all_gid)}")
 
     all_role = fncChooseFromList(
@@ -560,14 +691,14 @@ def fncBuildEnvfileContent() -> str:
     fncInfo("Tiered accounts create a second privileged login for superadmin users.")
     fncInfo(f"Example: base account {fncColor('john', 'cyan')} (no sudo) + tiered account "
             f"{fncColor('a-john', 'cyan')} (with sudo).")
-    fncInfo("This enforces least-privilege — daily work uses the regular account.")
+    fncInfo("This enforces least-privilege - daily work uses the regular account.")
 
     tiered = ask_bool("Enable tiered accounts for superadmin users?", default=False)
     if tiered:
         print()
         fncHeading("== Tiered Account: Prefix or Suffix? ==")
-        print(f"{fncColor('[1]', 'white')} Prefix — e.g. {fncColor('a-john', 'cyan')} (prefix {fncColor('a-', 'yellow')})")
-        print(f"{fncColor('[2]', 'white')} Suffix — e.g. {fncColor('john-adm', 'cyan')} (suffix {fncColor('-adm', 'yellow')})")
+        print(f"{fncColor('[1]', 'white')} Prefix - e.g. {fncColor('a-john', 'cyan')} (prefix {fncColor('a-', 'yellow')})")
+        print(f"{fncColor('[2]', 'white')} Suffix - e.g. {fncColor('john-adm', 'cyan')} (suffix {fncColor('-adm', 'yellow')})")
         while True:
             tier_mode_raw = input(
                 f"{fncColor('?', 'cyan')} Choose {fncColor('[1/2]', 'white')} [{fncColor('1', 'green')}]: "
@@ -734,28 +865,78 @@ def fncBuildEnvfileContent() -> str:
             "PDM_ENABLED='false'",
         ]
 
+    # ── Multi-host fan-out ────────────────────────────────────────────────────
+    print()
+    fncHeading("== Multi-host fan-out (replicate Linux accounts to other machines) ==")
+    fncInfo("By default every machine runs the reconciler independently.")
+    fncInfo("Alternatively, THIS host can push the same Linux user / sudo / tiered")
+    fncInfo("accounts to other machines over SSH whenever it syncs.")
+    fncWarn("Requires the SSH port (default 22) open from THIS host to each node,")
+    fncWarn("and the generated public key installed on each node (shown below).")
+    fanout = ask_bool("Fan out account changes to other machines over SSH?", default=False)
+    fanout_nodes: list[str] = []
+    fanout_user = "root"
+    if fanout:
+        raw_nodes = ask_nonempty("Target nodes - hostnames/IPs (space/comma-separated)")
+        fanout_nodes = [n for n in re.split(r"[,\s]+", raw_nodes) if n]
+        fanout_user = ask_nonempty("SSH user on the nodes (needs root or sudo to manage users)", default="root")
+        fanout_port = input(fncColor(f"SSH port to the nodes [{fncColor('22', 'green')}]: ", "cyan", "bold")).strip() or "22"
+        lines += [
+            "",
+            "# Multi-host fan-out",
+            "FANOUT_ENABLED='true'",
+            f"FANOUT_NODES={fncShQuote(' '.join(fanout_nodes))}",
+            f"FANOUT_SSH_USER={fncShQuote(fanout_user)}",
+            f"FANOUT_SSH_PORT={fncShQuote(fanout_port)}",
+        ]
+        fncOk(f"Fan-out enabled to {len(fanout_nodes)} node(s): {', '.join(fanout_nodes)}")
+    else:
+        lines += [
+            "",
+            "# Multi-host fan-out (disabled - each host runs independently)",
+            "FANOUT_ENABLED='false'",
+        ]
+
+    # ── SSH access key ────────────────────────────────────────────────────────
+    # Generated when any remote host needs it: PBS/PDM (handoff) or fan-out nodes
+    # (the reconciler uses the key to push account changes). The reconciler reads
+    # SSH_KEY_PATH + SSH_KEY_PASSPHRASE_ENC emitted by fncProvisionSshKey.
+    ssh_targets: list[tuple[str, str, str]] = []
+    if pbs:
+        ssh_targets.append(("PBS", pbs_host, "root"))
+    if pdm:
+        ssh_targets.append(("PDM", pdm_host, "root"))
+    if fanout:
+        for n in fanout_nodes:
+            ssh_targets.append(("Fan-out node", n, fanout_user))
+    if ssh_targets:
+        lines += fncProvisionSshKey(ssh_targets)
+    elif fanout:
+        fncErr("Fan-out enabled but no nodes/SSH key were provisioned; fan-out will be inactive.")
+
     return "\n".join(lines) + "\n"
 
 # ============================
 # Writers
 # ============================
 
-def fncSplitEnvfileIntoServices(content: str) -> tuple[str, str, str, str]:
-    """Split env file content into (main, graph, pbs, pdm) strings.
+def fncSplitEnvfileIntoServices(content: str) -> tuple[str, str, str, str, str]:
+    """Split env file content into (main, graph, pbs, pdm, ssh) strings.
 
-    Secret vars (token values, client secrets) are moved into their own
-    per-service files.  The main file retains all non-secret config so
-    a read of it alone reveals no usable credentials.
+    Secret vars (token values, client secrets, the SSH key passphrase) are moved
+    into their own per-service files.  The main file retains all non-secret
+    config so a read of it alone reveals no usable credentials.
 
-    Returns four strings: (main_content, graph_content, pbs_content, pdm_content).
+    Returns five strings: (main, graph_content, pbs_content, pdm_content, ssh_content).
     """
     main_lines: list[str] = []
-    graph_lines: list[str] = ["# Entramox Reconciler — Graph credentials (mode 0600)"]
-    pbs_lines:   list[str] = ["# Entramox Reconciler — PBS credentials (mode 0600)"]
-    pdm_lines:   list[str] = ["# Entramox Reconciler — PDM credentials (mode 0600)"]
+    graph_lines: list[str] = ["# Entramox Reconciler - Graph credentials (mode 0600)"]
+    pbs_lines:   list[str] = ["# Entramox Reconciler - PBS credentials (mode 0600)"]
+    pdm_lines:   list[str] = ["# Entramox Reconciler - PDM credentials (mode 0600)"]
+    ssh_lines:   list[str] = ["# Entramox Reconciler - SSH key passphrase (mode 0600)"]
 
     # Track which service files got at least one real assignment
-    graph_has_vars = pbs_has_vars = pdm_has_vars = False
+    graph_has_vars = pbs_has_vars = pdm_has_vars = ssh_has_vars = False
 
     for raw_line in content.splitlines():
         stripped = raw_line.strip()
@@ -767,24 +948,30 @@ def fncSplitEnvfileIntoServices(content: str) -> tuple[str, str, str, str]:
                 graph_lines.append(raw_line)
                 graph_has_vars = True
                 # Leave a comment placeholder in the main file
-                main_lines.append(f"# {key} — moved to {GRAPH_ENVFILE}")
+                main_lines.append(f"# {key} - moved to {GRAPH_ENVFILE}")
                 continue
             if key in _PBS_SECRET_VARS:
                 pbs_lines.append(raw_line)
                 pbs_has_vars = True
-                main_lines.append(f"# {key} — moved to {PBS_ENVFILE}")
+                main_lines.append(f"# {key} - moved to {PBS_ENVFILE}")
                 continue
             if key in _PDM_SECRET_VARS:
                 pdm_lines.append(raw_line)
                 pdm_has_vars = True
-                main_lines.append(f"# {key} — moved to {PDM_ENVFILE}")
+                main_lines.append(f"# {key} - moved to {PDM_ENVFILE}")
+                continue
+            if key in _SSH_SECRET_VARS:
+                ssh_lines.append(raw_line)
+                ssh_has_vars = True
+                main_lines.append(f"# {key} - moved to {SSH_ENVFILE}")
                 continue
         main_lines.append(raw_line)
 
     graph_content = "\n".join(graph_lines) + "\n" if graph_has_vars else ""
     pbs_content   = "\n".join(pbs_lines)   + "\n" if pbs_has_vars  else ""
     pdm_content   = "\n".join(pdm_lines)   + "\n" if pdm_has_vars  else ""
-    return "\n".join(main_lines) + "\n", graph_content, pbs_content, pdm_content
+    ssh_content   = "\n".join(ssh_lines)   + "\n" if ssh_has_vars  else ""
+    return "\n".join(main_lines) + "\n", graph_content, pbs_content, pdm_content, ssh_content
 
 
 def _ensure_conf_dir():
@@ -794,8 +981,18 @@ def _ensure_conf_dir():
 
 
 def _write_secret_file(path: Path, content: str, label: str):
-    """Write a per-service secret file with mode 0600."""
-    if content.strip() and not content.strip().startswith("#"):
+    """Write a per-service secret file with mode 0600.
+
+    The content always begins with a header comment, so we must look for at
+    least one real (non-comment, non-blank) assignment line to decide whether
+    there's anything worth writing -- checking only the first character would
+    always see the '#' header and skip the file.
+    """
+    has_assignment = any(
+        line.strip() and not line.strip().startswith("#")
+        for line in content.splitlines()
+    )
+    if has_assignment:
         path.write_text(content, encoding="utf-8")
         os.chmod(path, 0o600)
         fncOk(f"Wrote {label} to " + fncColor(str(path), "white", "bold") + " (mode 0600)")
@@ -809,7 +1006,7 @@ def _write_secret_file(path: Path, content: str, label: str):
 def fncWriteEnvfile(content: str):
     """Write the main env file and split secrets into per-service files."""
     _ensure_conf_dir()
-    main_content, graph_content, pbs_content, pdm_content = fncSplitEnvfileIntoServices(content)
+    main_content, graph_content, pbs_content, pdm_content, ssh_content = fncSplitEnvfileIntoServices(content)
 
     # Write main config (no secrets)
     if ENVFILE.exists():
@@ -824,12 +1021,14 @@ def fncWriteEnvfile(content: str):
     _write_secret_file(GRAPH_ENVFILE, graph_content, "Graph credentials")
     _write_secret_file(PBS_ENVFILE,   pbs_content,   "PBS credentials")
     _write_secret_file(PDM_ENVFILE,   pdm_content,   "PDM credentials")
+    _write_secret_file(SSH_ENVFILE,   ssh_content,   "SSH key passphrase")
 
     fncInfo(
         "Secrets split into separate files: "
         + fncColor(str(GRAPH_ENVFILE), "white") + ", "
         + fncColor(str(PBS_ENVFILE),   "white") + ", "
-        + fncColor(str(PDM_ENVFILE),   "white")
+        + fncColor(str(PDM_ENVFILE),   "white") + ", "
+        + fncColor(str(SSH_ENVFILE),   "white")
     )
 
 def fncWriteChecker(expected_sha: str):
@@ -867,6 +1066,10 @@ def fncWriteChecker(expected_sha: str):
         expected_pdm_sha = fncSha256Sum(PDM_ENVFILE) if PDM_ENVFILE.exists() else ""
     except Exception:
         expected_pdm_sha = ""
+    try:
+        expected_ssh_sha = fncSha256Sum(SSH_ENVFILE) if SSH_ENVFILE.exists() else ""
+    except Exception:
+        expected_ssh_sha = ""
 
     # Write baseline file (separate from checker script)
     _ensure_conf_dir()
@@ -877,6 +1080,7 @@ def fncWriteChecker(expected_sha: str):
         f"graph_env={expected_graph_sha}\n"
         f"pbs_env={expected_pbs_sha}\n"
         f"pdm_env={expected_pdm_sha}\n"
+        f"ssh_env={expected_ssh_sha}\n"
     )
     BASELINE.write_text(baseline_content, encoding="utf-8")
     os.chmod(BASELINE, 0o400)  # read-only by root; never rewritten by service
@@ -891,6 +1095,7 @@ KEYFILE="{KEYFILE}"
 GRAPH_ENVFILE="{GRAPH_ENVFILE}"
 PBS_ENVFILE="{PBS_ENVFILE}"
 PDM_ENVFILE="{PDM_ENVFILE}"
+SSH_ENVFILE="{SSH_ENVFILE}"
 BASELINE="{BASELINE}"
 LOGFILE="{LOGDIR}/thelog.log"
 
@@ -988,34 +1193,35 @@ if [[ -e "$KEYFILE" && -n "$EXPECTED_KEY_SHA" ]]; then
 fi
 
 # ── Per-service credential file checks ───────────────────────────────────
+# A credential file is only expected when its baseline hash is non-empty (the
+# service was configured at install time). Services left disabled have an empty
+# baseline entry, so we skip them silently instead of crying "missing file".
 EXPECTED_GRAPH_SHA=$(read_baseline "graph_env")
 EXPECTED_PBS_SHA=$(read_baseline "pbs_env")
 EXPECTED_PDM_SHA=$(read_baseline "pdm_env")
+EXPECTED_SSH_SHA=$(read_baseline "ssh_env")
 
-for cred_file in "$GRAPH_ENVFILE" "$PBS_ENVFILE" "$PDM_ENVFILE"; do
-    check_secure_file "$cred_file"
-done
-
-if [[ -e "$GRAPH_ENVFILE" && -n "$EXPECTED_GRAPH_SHA" ]]; then
-    ACTUAL_GRAPH_SHA=$(sha256_file "$GRAPH_ENVFILE")
-    if [[ "$ACTUAL_GRAPH_SHA" != "$EXPECTED_GRAPH_SHA" ]]; then
-        log_warn "Integrity: env checksum changed path=$GRAPH_ENVFILE have=$ACTUAL_GRAPH_SHA expect=$EXPECTED_GRAPH_SHA"
+check_cred_file() {{
+    local p="$1"
+    local expected="$2"
+    # Not configured at install (no baseline hash) -> nothing to verify.
+    if [[ -z "$expected" ]]; then
+        return 0
     fi
-fi
-
-if [[ -e "$PBS_ENVFILE" && -n "$EXPECTED_PBS_SHA" ]]; then
-    ACTUAL_PBS_SHA=$(sha256_file "$PBS_ENVFILE")
-    if [[ "$ACTUAL_PBS_SHA" != "$EXPECTED_PBS_SHA" ]]; then
-        log_warn "Integrity: env checksum changed path=$PBS_ENVFILE have=$ACTUAL_PBS_SHA expect=$EXPECTED_PBS_SHA"
+    check_secure_file "$p"   # warns if missing; fails on symlink/owner/mode
+    if [[ -e "$p" ]]; then
+        local actual
+        actual=$(sha256_file "$p")
+        if [[ "$actual" != "$expected" ]]; then
+            log_warn "Integrity: env checksum changed path=$p have=$actual expect=$expected"
+        fi
     fi
-fi
+}}
 
-if [[ -e "$PDM_ENVFILE" && -n "$EXPECTED_PDM_SHA" ]]; then
-    ACTUAL_PDM_SHA=$(sha256_file "$PDM_ENVFILE")
-    if [[ "$ACTUAL_PDM_SHA" != "$EXPECTED_PDM_SHA" ]]; then
-        log_warn "Integrity: env checksum changed path=$PDM_ENVFILE have=$ACTUAL_PDM_SHA expect=$EXPECTED_PDM_SHA"
-    fi
-fi
+check_cred_file "$GRAPH_ENVFILE" "$EXPECTED_GRAPH_SHA"
+check_cred_file "$PBS_ENVFILE"   "$EXPECTED_PBS_SHA"
+check_cred_file "$PDM_ENVFILE"   "$EXPECTED_PDM_SHA"
+check_cred_file "$SSH_ENVFILE"   "$EXPECTED_SSH_SHA"
 
 exit 0
 """
@@ -1025,7 +1231,7 @@ exit 0
 
 def fncWriteUnits():
     service_unit = f"""[Unit]
-Description=Entramox Reconciler — Proxmox OIDC to Linux user sync
+Description=Entramox Reconciler - Proxmox OIDC to Linux user sync
 After=network-online.target pve-cluster.service
 Wants=network-online.target
 
@@ -1039,6 +1245,7 @@ EnvironmentFile=-{KEYFILE}
 EnvironmentFile=-{GRAPH_ENVFILE}
 EnvironmentFile=-{PBS_ENVFILE}
 EnvironmentFile=-{PDM_ENVFILE}
+EnvironmentFile=-{SSH_ENVFILE}
 ExecCondition={CHECKER}
 ExecStart=/usr/bin/python3 {SCRIPT_DST}
 User=root
@@ -1178,13 +1385,16 @@ def fncDoInstall():
 
     expected_sha = fncSha256Sum(SCRIPT_DST)
     fncInfo(f"Calculated SHA256: {fncColor(expected_sha, 'white', 'bold')}")
-    fncWriteChecker(expected_sha)
 
     LOGDIR.mkdir(mode=0o750, parents=True, exist_ok=True)
     fncOk(f"Ensured log directory {LOGDIR}")
 
     env_content = fncBuildEnvfileContent()
     fncWriteEnvfile(env_content)
+
+    # Baseline AFTER env files exist, so their hashes are captured and actually
+    # verified at runtime (otherwise the baseline records empty env hashes).
+    fncWriteChecker(expected_sha)
 
     fncWriteUnits()
 
@@ -1253,7 +1463,7 @@ def fncDoUpdate(auto_restart: bool = False):
 
     # Update script if needed
     if local_sha == installed_sha:
-        fncWarn("Current installed version already matches local — no update needed.")
+        fncWarn("Current installed version already matches local - no update needed.")
     else:
         fncInfo("Updating installed script...")
         shutil.copy2(SCRIPT_SRC, SCRIPT_DST)
@@ -1263,9 +1473,12 @@ def fncDoUpdate(auto_restart: bool = False):
         if new_installed_sha != local_sha:
             fncErr("Post-copy SHA mismatch! Aborting.")
             sys.exit(1)
+        fncOk("Script updated.")
 
-        fncWriteChecker(new_installed_sha)
-        fncOk("Script updated and checksum refreshed.")
+    # Always refresh the baseline so it matches the final on-disk state (script
+    # AND env files). Doing this unconditionally avoids stale-baseline
+    # "checksum changed" warnings when only the config was re-run.
+    fncWriteChecker(fncSha256Sum(SCRIPT_DST))
 
     # Re-write units (ensures timer points at the right service name)
     fncWriteUnits()
